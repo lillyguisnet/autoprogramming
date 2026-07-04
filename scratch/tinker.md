@@ -15,6 +15,47 @@ ap.__version__
 ## Example
 
 ```py
+class plan(str): ...
+class summary(str): ...
+from typing import Callable
+
+planner: Callable[[str, str], tuple[plan, summary]] = lambda var1, var2: ...
+
+
+class Search(dspy.Signature):
+    """Generate a focused search query based on the plan."""
+    plan: str = dspy.InputField()
+    query: str = dspy.OutputField()
+
+class WriteReport(dspy.Signature):
+    """Write a clear answer based on the research findings."""
+    question: str = dspy.InputField()
+    findings: str = dspy.InputField()
+    report: str = dspy.OutputField()
+
+class ResearchAgent(dspy.Module):
+    def __init__(self):
+        super().__init__()
+        self.planner = Callable[str, plan]] = lambda question: ...
+        self.searcher = dspy.Predict(Search)
+        self.writer = dspy.Predict(WriteReport)
+
+    def forward(self, question):
+        plan = self.planner(question=question)
+        results = self.searcher(plan=plan.plan)
+        return self.writer(question=question, findings=results.query)
+
+app = with_memory(ResearchAgent(), recursive=True)
+state = app.new_state()
+with app.use_state(state):
+    app(question="What are the latest advances in quantum computing?")
+print(len(state.turns))                          # 1 root turn
+print(len(state.node_states["planner"].turns))   # 1 planner turn
+print(len(state.node_states["searcher"].turns))  # 1 searcher turn
+```
+
+
+```py
 import autoprogramming as ap
 
 class Answer(str): ...
