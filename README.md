@@ -144,12 +144,19 @@ The metric file records who approved it and when. Changing the metric invalidate
 
 ### The agent writes candidates
 
-The seed candidate is a complete module. Note: no work at import time — clients and models load lazily, so importing the package never requires an API key or network:
+Every candidate is a **PEP 723 single-file script** — inline metadata that `uv run` understands natively. The seed candidate is a complete module. Note: no work at import time — clients and models load lazily, so importing the package never requires an API key or network:
 
 ```py
 # candidates/candidate_0.py
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["openai>=1.0", "translate-ap"]
+#
+# [tool.uv.sources]
+# translate-ap = { path = "..", editable = true }
+# ///
 from openai import OpenAI
-from ..schema import French
+from translate_ap.schema import French
 
 _client = None
 
@@ -167,14 +174,22 @@ def predict(english: str) -> French:
         max_tokens=256,
     )
     return French(response.choices[0].message.content.strip())
+
+if __name__ == "__main__":
+    import sys
+    print(predict(sys.argv[1]))
 ```
 
-Each candidate declares its own dependencies in a header the packager reads:
+This buys three things at once:
 
-```py
-# candidates/candidate_0.py
-# ap-requires: openai>=1.0
+```sh
+uv run candidates/candidate_0.py "Hello, how are you?"
+# => Bonjour, comment allez-vous ?
 ```
+
+- **Every candidate runs standalone.** `uv run` reads the `# /// script` block, builds an ephemeral venv with exactly that candidate's deps, and executes it. Debugging a candidate is running a file — no project setup.
+- **Candidates with conflicting dependencies coexist.** candidate_2 can need `transformers==4.40` while candidate_5 needs `4.51`; the eval harness runs each in its own uv-resolved environment. The dependency solver is uv's, not ours.
+- **The packager reads the same block.** No parallel metadata format to keep in sync — the active candidate's `dependencies` list *is* the package's dependency list.
 
 The agent evaluates, reflects on **train** failures, then copies and edits the file to create a new candidate:
 
@@ -226,7 +241,7 @@ translate("Hello, how are you?")
 
 `French` is a `str` subclass — works everywhere a string does.
 
-**What `activate()` does, mechanically:** it writes `active.json` with the chosen candidate's name and its pinned test score, and regenerates `pyproject.toml` so the package's dependencies are exactly the active candidate's `ap-requires` lines (plus its artifacts). `__init__.py` reads `active.json` and imports that one candidate. Switching candidates is a one-line diff you can review, commit, and revert.
+**What `activate()` does, mechanically:** it writes `active.json` with the chosen candidate's name and its pinned test score, and regenerates `pyproject.toml` so the package's dependencies are exactly the active candidate's PEP 723 `dependencies` list (minus the self-reference, plus its artifacts). `__init__.py` reads `active.json` and imports that one candidate. Switching candidates is a one-line diff you can review, commit, and revert.
 
 ### Log production traffic
 
@@ -272,7 +287,7 @@ It's a package with a `pyproject.toml`, so it distributes like one:
 pip install ./translate_ap          # deps of the active candidate install automatically
 ```
 
-Heavy candidates keep their weights in `artifacts/` (tracked with git-lfs) or declare a download step (`# ap-fetch: huggingface:Helsinki-NLP/opus-mt-en-fr`) that runs on first use. Zipping the directory works too — `artifacts/` goes with it.
+Heavy candidates keep their weights in `artifacts/` (tracked with git-lfs) or declare a download step in their PEP 723 block (`[tool.ap] fetch = ["huggingface:Helsinki-NLP/opus-mt-en-fr"]`) that runs on first use. Zipping the directory works too — `artifacts/` goes with it.
 
 ## Building a program conversationally
 
@@ -299,9 +314,13 @@ A candidate is just a `predict` function — the agent can write anything:
 **Classical ML** — lightweight and fast:
 ```py
 # candidates/candidate_3.py
-# ap-requires: scikit-learn>=1.4
+# /// script
+# dependencies = ["scikit-learn>=1.4", "translate-ap"]
+# [tool.uv.sources]
+# translate-ap = { path = "..", editable = true }
+# ///
 import pickle
-from ..paths import artifacts    # ap-provided: resolves to the package's artifacts/ dir
+from translate_ap.paths import artifacts   # resolves to the package's artifacts/ dir
 
 _model = None
 
@@ -328,8 +347,13 @@ def predict(english: str) -> French:
 **Local deep learning** — no API cost per call:
 ```py
 # candidates/candidate_5.py
-# ap-requires: transformers>=4.40, torch
-# ap-fetch: huggingface:Helsinki-NLP/opus-mt-en-fr
+# /// script
+# dependencies = ["transformers>=4.40", "torch", "translate-ap"]
+# [tool.uv.sources]
+# translate-ap = { path = "..", editable = true }
+# [tool.ap]
+# fetch = ["huggingface:Helsinki-NLP/opus-mt-en-fr"]
+# ///
 from transformers import MarianMTModel, MarianTokenizer
 
 _tok, _model = None, None
@@ -346,45 +370,3 @@ def predict(english: str) -> French:
 **Decomposed pipeline** — idiom table → local model → LLM refinement for long sentences, each part handling what it's best at.
 
 The agent tries different approaches, scores them on the same val set with the same approved metric, and keeps what wins. A rule-based candidate that scores 0.95 beats an LLM candidate that scores 0.90 — *provided the confidence intervals separate and the memorization check passes*. The agent doesn't care how it works, only that it satisfies the schema and honestly beats the alternatives.
-
-## Execution model & trust
-
-The agent writes and runs code, and installs packages. That happens inside a sandbox, not on your bare machine:
-
-- Candidates execute in an isolated environment with access to `data/`, `artifacts/`, and (if question 5 allowed it) the network.
-- `pip install` is restricted to an allowlist derived from question 5; anything outside it prompts you.
-- Your data leaves the machine only via APIs you approved in question 5. "Must stay local" means LLM-API candidates are simply not in the search space.
-- Every candidate the agent produces is a small, readable `.py` file — review the winner before you `activate` it, the same way you'd review a PR.
-
-### Tools the agent needs
-
-```
-filesystem       create the workspace, write/copy/edit candidate files
-python_repl      run candidates in the sandbox, inspect traces
-llm_apis         call approved providers from candidate code
-web_search       domain knowledge, pretrained model discovery
-pip_install      allowlisted installs into the sandbox
-user_confirm     metric sign-off, synthetic-data validation, allowlist escalations
-prg.*            eval / traced runs / frontier / budget (as above)
-```
-
-## Exploration strategy
-
-Structured search, so budget isn't wasted on redundant candidates.
-
-**Phase 1: Baseline sweep (~10% of budget).** Establish the floor and a cheap ceiling estimate:
-1. A trivial candidate (rules, lookup, simplest heuristic) — candidate_0, which everything must beat.
-2. The cheapest viable LLM with a minimal prompt — often already hard to beat.
-3. A pretrained model, if one exists for the domain.
-
-**Phase 2: Targeted mutation (~60%).** Improve the leader by studying its **train** failures:
-1. `prg.eval(best, split="train", per_instance=True)` — find the worst train rows.
-2. `prg.run(best, split="train", row=…)` — read full traces to understand *why*.
-3. Copy, make **one** targeted edit (prompt, model, parsing, or a preprocessing step — never several at once, or improvement can't be attributed).
-4. `prg.eval(new)` on val. Keep only if the confidence interval vs the parent excludes zero.
-
-**Phase 3: Structural exploration (~20%).** When mutation plateaus (3 consecutive non-improvements), change the approach: LLM → local model, single model → decomposed pipeline, expensive winner → distilled cheap version.
-
-**Phase 4: Finalize (~10%).** The harness re-scores the top candidates on val with extra repeats, then runs the **one-time test evaluation** and activates the winner. Val-vs-test gaps are reported per candidate; a candidate that collapses on test is demoted no matter its val rank.
-
-**Diversity via Pareto.** Don't keep only the global best. `prg.frontier()` tracks which candidate is best on *each train row*; a candidate that's worse on average but uniquely solves hard rows carries information. Mutation ancestors are sampled from the frontier, not just the leader — this is what keeps the search out of local optima.
