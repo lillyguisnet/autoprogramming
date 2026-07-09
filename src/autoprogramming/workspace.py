@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import importlib.resources
 import importlib.util
 import json
 import keyword
@@ -26,6 +27,23 @@ from .errors import CandidateError, WorkspaceError
 from .schema import Schema
 
 TEST_CSV_PERMS = 0o400
+
+#: Skill-discovery roots written into every workspace. Together they cover
+#: Claude Code, Codex, Copilot, Cursor, Gemini, OpenCode, Amp, and Windsurf.
+SKILL_DISCOVERY_ROOTS = (".agents", ".claude")
+
+
+def _optimizer_skill_bytes() -> bytes:
+    """The packaged candidate-optimizer SKILL.md, byte-exact.
+
+    The same file backs OPTIMIZER_PROMPT (see backend.py); workspaces get
+    verbatim copies so a coding agent cd'd into one picks the expertise up
+    through normal skill discovery.
+    """
+    return (
+        importlib.resources.files("autoprogramming")
+        / "skills" / "candidate-optimizer" / "SKILL.md"
+    ).read_bytes()
 
 _PEP723_BLOCK = re.compile(
     r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$"
@@ -506,6 +524,16 @@ class Workspace:
             "val_scored": [],
             "flags": {},
         }, indent=2) + "\n")
+
+        # Embed the candidate-optimizer skill so any skills-capable coding
+        # agent working in the workspace discovers the optimizer expertise.
+        # Dev-time only: deliberately NOT listed in the generated pyproject's
+        # package-data — skills are not shipped runtime files.
+        skill = _optimizer_skill_bytes()
+        for discovery_root in SKILL_DISCOVERY_ROOTS:
+            skill_dir = ws.root / discovery_root / "skills" / "candidate-optimizer"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_bytes(skill)
 
         ws._schema = schema
         return ws

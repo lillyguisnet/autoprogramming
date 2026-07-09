@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.resources
 import json
 import shutil
 import string
@@ -14,15 +15,45 @@ from .errors import AutoProgrammingError, RunnerError
 if TYPE_CHECKING:
     from .harness import AgentHarness
 
+#: Where the canonical optimizer expertise lives, relative to this package.
+#: The same file is copied verbatim into every generated workspace (under
+#: .agents/skills/ and .claude/skills/), and its body is embedded below in
+#: OPTIMIZER_PROMPT — one source of truth, edited in exactly one place.
+SKILL_RESOURCE = ("skills", "candidate-optimizer", "SKILL.md")
 
-OPTIMIZER_PROMPT = """\
-You are the optimizer agent for an autoprogramming workspace. Your job is to
-find the best implementation of one typed program by writing, evaluating, and
-evolving complete candidate implementations — plain Python files — under a
-strict data discipline and an explicit budget.
 
-Workspace (work from here; it is itself a valid, installable Python package):
+def _load_skill_body() -> str:
+    """Read the packaged candidate-optimizer SKILL.md, frontmatter stripped.
+
+    The frontmatter (name/description) is skill-discovery metadata; only the
+    Markdown body is expertise, so only the body goes into the prompt.
+    """
+    resource = importlib.resources.files(__package__)
+    for part in SKILL_RESOURCE:
+        resource = resource / part
+    text = resource.read_text(encoding="utf-8")
+    marker = "\n---\n"
+    if not text.startswith("---\n") or marker not in text[4:]:
+        raise AutoProgrammingError(
+            "The packaged candidate-optimizer SKILL.md is malformed: it must "
+            "start with a '---' frontmatter block (Agent Skills spec) so the "
+            "prompt builder can strip the metadata and embed the body. "
+            "Restore src/autoprogramming/skills/candidate-optimizer/SKILL.md."
+        )
+    return text[text.index(marker, 4) + len(marker):].lstrip("\n")
+
+
+#: Dynamic header: the per-run facts build_prompt() substitutes. Everything
+#: static — the expertise — comes from the shared skill body appended below.
+_PROMPT_HEADER = """\
+You are the optimizer agent for the autoprogramming workspace at:
   $workspace
+
+Work from that directory. Everything after this header is the
+candidate-optimizer skill, byte-for-byte the same one embedded in the
+workspace under .agents/skills/candidate-optimizer/; where it says to read a
+per-workspace fact from the workspace, the resolved values here already
+answer it.
 
 Program schema (immutable — you satisfy it; you never edit schema.py):
 $schema
@@ -30,108 +61,16 @@ $schema
 Data: $data_sizes.
 $bootstrap_note
 Budget remaining: $budget
-Every evaluation call is charged against this budget — LLM candidates cost
-money to SCORE, not just to write. Check prg.budget between iterations and
-stop cleanly before it runs dry.
 Run context: $context
 
-== Attach ==
+Attach with:
 
     import autoprogramming as ap
     prg = ap.attach("$workspace")
 
-`prg` is your handle. Everything else is file operations on candidates/*.py.
-
-    prg.schema                                   # inputs/outputs & docstrings
-    prg.data.train                               # readable rows: iterate, sample, inspect
-    prg.data.val                                 # len() only — val rows are never readable
-    prg.budget                                   # remaining dollars / eval_calls / minutes
-    prg.propose_metric(code, examples, note="")  # metric sign-off — FIRST, before any eval
-    prg.new_candidate(source=...)                # or prg.new_candidate(from_="candidate_0")
-    prg.eval("candidate_1")                      # val score: aggregate + 95% CI only
-    prg.eval("candidate_1", split="train", per_instance=True)   # per-row — train only
-    prg.run("candidate_1", split="train", row=17)               # full trace — train only
-    prg.compare("candidate_0", "candidate_1")    # paired bootstrap diff on val
-    prg.frontier()                               # Pareto frontier over train rows
-    prg.finalize(top_k=2)                        # one-time test eval + activation — LAST
-
-== Step 0: metric sign-off, before ANY scoring ==
-
-The entire search optimizes whatever metric.py says; a wrong metric produces a
-confidently-scored wrong program. The metric is proposed, demonstrated, and
-approved — never silently trusted:
-
-1. Write the metric source: `def metric(predicted, expected) -> float` for a
-   single-output program, or dict -> dict keyed by output names for a
-   multi-output program.
-2. Pick 3+ real (predicted, expected) pairs that show its judgment: an exact
-   match, a near miss (synonym / rounding), and a clear failure.
-3. Call prg.propose_metric(code, examples). True means approved — proceed.
-   A string is user feedback — revise the metric and propose again.
-
-Changing the metric later invalidates every recorded score, so get this right
-before spending budget.
-
-== Data discipline (harness-enforced; violations raise, they don't warn) ==
-
-- Reflect on TRAIN failures only. prg.run() and per-instance scores are
-  refused on val and test. You never learn why a val row scored low — only
-  the aggregate — so you cannot edit candidates to fix specific val rows.
-- VAL is for selection only, and selection pressure is capped. Every eval
-  scores the identical val set; the harness counts how many distinct
-  candidates val has judged, and past its capacity val scores lose meaning
-  and are not reported as final. Do not burn val evals on trivial variants.
-- TEST is off-limits to you entirely. prg.finalize() — the harness, not you —
-  evaluates it once, at the end, on the top candidates, then activates the
-  winner.
-- "Improved" means the paired-bootstrap CI excludes zero, not that the point
-  estimate went up. Use prg.compare() before believing a win.
-- Memorizers are flagged and excluded from selection: train score far above
-  val, or verbatim training outputs pasted into candidate source. A lookup
-  table over train inputs cannot win; a candidate only wins on data it
-  never saw.
-
-== Candidate conventions: PEP 723 single-file scripts in candidates/ ==
-
-- Each candidate is candidates/candidate_<n>.py defining
-  `predict(<input names>)` that returns the output value (or a tuple in
-  schema order for multi-output programs). Create files with
-  prg.new_candidate; edit them like any Python file.
-- Dependencies go in a PEP 723 block at the top of the file:
-
-      # /// script
-      # requires-python = ">=3.11"
-      # dependencies = ["openai>=1.0"]
-      # ///
-
-  stdlib-only candidates need no block at all. Candidates with conflicting
-  dependencies can coexist — each runs in its own environment.
-- No work at import time: clients and models load lazily inside predict(),
-  so importing the package never needs an API key or network access.
-- A candidate that makes no stochastic calls should declare
-  `[tool.ap]` with `deterministic = true` in its block — it is then scored
-  with 1 repeat instead of 3, which saves budget.
-- A candidate that spends money per call should set the module global
-  AP_COST_DOLLARS after each predict() so the ledger stays honest.
-- Model weights, pickles, and lookup tables belong in artifacts/, resolved
-  via `from <package>.paths import artifacts`.
-- Explore genuinely different approaches — an LLM call, regex rules,
-  classical ML, a local model, a pipeline of all four. The metric does not
-  care how a candidate works, only that it wins honestly.
-
-== The loop ==
-
-1. Seed a complete, working candidate; eval it on val for a baseline.
-2. prg.eval(name, split="train", per_instance=True) to find the worst train
-   rows; prg.run() them; read the traces; form a hypothesis.
-3. prg.new_candidate(from_=best), edit, eval. Keep it only if prg.compare()
-   says the CI excludes zero.
-4. Repeat while prg.budget affords another iteration. Stop early when
-   improvements stop separating from noise — a spent budget with no clear
-   winner is worse than an early stop.
-5. Finish with prg.finalize() so test is evaluated once and a winner is
-   activated. Do not skip this: an un-finalized workspace ships nothing.
 """
+
+OPTIMIZER_PROMPT = _PROMPT_HEADER + _load_skill_body()
 
 
 def build_prompt(harness: "AgentHarness", context: dict) -> str:
@@ -195,7 +134,10 @@ class NoOpBackend:
                 [
                     "[autoprogramming] no agent backend ran (NoOpBackend).",
                     f"Workspace ready at: {root}",
-                    "Attach and optimize manually:",
+                    "The workspace already contains the candidate-optimizer skill",
+                    "(.agents/skills/ and .claude/skills/), so any skills-capable",
+                    "coding agent cd'd into it picks the expertise up automatically.",
+                    "Or attach and optimize manually:",
                     "",
                     "    import autoprogramming as ap",
                     f'    prg = ap.attach("{root}")',

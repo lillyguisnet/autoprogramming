@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.resources
 import json
 import shutil
 from pathlib import Path
@@ -92,8 +93,29 @@ def test_optimizer_prompt_states_the_contract():
 
 def test_prompt_metric_signoff_comes_before_the_loop():
     assert OPTIMIZER_PROMPT.index("metric sign-off") < OPTIMIZER_PROMPT.index(
-        "== The loop =="
+        "## The loop"
     )
+
+
+def test_optimizer_prompt_embeds_the_packaged_skill_body(tmp_path):
+    """The sync guarantee: editing SKILL.md changes the CLI prompt too."""
+    skill_text = (
+        importlib.resources.files("autoprogramming")
+        / "skills" / "candidate-optimizer" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    frontmatter_end = skill_text.index("\n---\n", 4)
+    body = skill_text[frontmatter_end + len("\n---\n"):].strip()
+
+    # The whole skill body is embedded verbatim — no second copy to drift.
+    assert body in OPTIMIZER_PROMPT
+    # ...but the frontmatter (discovery metadata) is stripped.
+    assert "name: candidate-optimizer" not in OPTIMIZER_PROMPT
+
+    # And it survives substitution into the concrete prompt (so the body may
+    # never contain a bare '$', which string.Template would choke on).
+    prompt = build_prompt(make_harness(tmp_path), {"mode": "optimize"})
+    assert body in prompt
+    assert "Candidate optimizer for autoprogramming workspaces" in prompt
 
 
 # ------------------------------------------------------------ build_prompt
@@ -148,6 +170,9 @@ def test_noop_backend_prints_attach_instructions(tmp_path, capsys):
     assert NoOpBackend().run(harness, {"mode": "optimize"}) is None
     out = capsys.readouterr().out
     assert str(harness.workspace.root) in out
+    assert "candidate-optimizer skill" in out
+    assert ".agents/skills/" in out
+    assert ".claude/skills/" in out
     assert "ap.attach" in out
     assert "propose_metric" in out
     assert "prg.eval" in out

@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import importlib
+import importlib.resources
 import json
 import os
 import re
@@ -158,6 +159,28 @@ def test_create_scaffolds_all_files(tmp_path):
     assert ws.package_name == "shout_ap"
     assert ws.dist_name == "shout-ap"
     assert ws.program_name == "shout"
+
+
+def test_create_embeds_candidate_optimizer_skill(tmp_path):
+    """Both discovery roots get byte-identical copies of the packaged skill."""
+    ws = make_workspace(tmp_path)
+    source = (
+        importlib.resources.files("autoprogramming")
+        / "skills" / "candidate-optimizer" / "SKILL.md"
+    ).read_bytes()
+    for discovery_root in (".agents", ".claude"):
+        copy = ws.root / discovery_root / "skills" / "candidate-optimizer" / "SKILL.md"
+        assert copy.is_file(), discovery_root
+        assert copy.read_bytes() == source, discovery_root
+
+
+def test_embedded_skill_is_not_in_generated_package_data(tmp_path):
+    """Skills are dev-time files; the shipped package must not carry them."""
+    ws = make_workspace(tmp_path)
+    doc = tomllib.loads(ws.pyproject.read_text())
+    package_data = doc["tool"]["setuptools"]["package-data"]["shout_ap"]
+    assert not any("skill" in pattern.lower() for pattern in package_data)
+    assert not any(pattern.startswith(".") for pattern in package_data)
 
 
 def test_created_pyproject_is_valid_and_installable_shape(tmp_path):
