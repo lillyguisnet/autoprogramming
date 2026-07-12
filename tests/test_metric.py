@@ -282,8 +282,8 @@ def test_demonstrate_uses_current_unapproved_metric(ws):
     assert not metric.is_approved(ws)
     demo = metric.demonstrate(ws, [("HI!", "HI!"), ("HI!", "NO!")])
     assert demo == [
-        {"predicted": "HI!", "expected": "HI!", "score": 1.0},
-        {"predicted": "HI!", "expected": "NO!", "score": 0.0},
+        {"predicted": "HI!", "expected": "HI!", "scores": {"quality": 1.0}, "score": 1.0},
+        {"predicted": "HI!", "expected": "NO!", "scores": {"quality": 0.0}, "score": 0.0},
     ]
 
 
@@ -399,3 +399,139 @@ def test_reapproval_does_not_change_the_metric_sha(ws):
     record = json.loads(ws.metric_approval.read_text())
     assert record["approved_by"] == "someone else"
     assert ws.metric_py.read_text().startswith("# metric.py — approved by someone else")
+
+
+# ------------------------------------------------------- multi-metric objectives
+
+
+MULTI = (
+    "def exact(predicted, expected):\n"
+    "    return 1.0 if predicted == expected else 0.0\n"
+    "\n\n"
+    "def graded(predicted, expected):\n"
+    "    return 0.5\n"
+    "\n\n"
+    "METRICS = {'exact': exact, 'graded': graded}\n"
+)
+
+
+def test_quality_metrics_single_defaults_to_quality(ws):
+    metric.write_metric(ws, EXACT)
+    metrics = metric.quality_metrics(ws)
+    assert set(metrics) == {"quality"}
+    assert metrics["quality"]("a", "a") == 1.0
+    assert metrics["quality"]("a", "b") == 0.0
+
+
+def test_quality_metrics_multi_returns_named_dict(ws):
+    metric.write_metric(ws, MULTI)
+    metrics = metric.quality_metrics(ws)
+    assert list(metrics) == ["exact", "graded"]
+    assert metrics["exact"]("a", "a") == 1.0
+    assert metrics["graded"]("a", "b") == 0.5
+
+
+def test_quality_metrics_dict_wins_over_single_metric(ws):
+    metric.write_metric(ws, EXACT + "\nMETRICS = {'renamed': metric}\n")
+    assert list(metric.quality_metrics(ws)) == ["renamed"]
+
+
+def test_quality_metrics_empty_name_rejected(ws):
+    metric.write_metric(ws, "def m(p, e):\n    return 1.0\nMETRICS = {'': m}\n")
+    with pytest.raises(SchemaError, match="name"):
+        metric.quality_metrics(ws)
+
+
+def test_quality_metrics_non_callable_rejected(ws):
+    metric.write_metric(ws, "METRICS = {'x': 5}\n")
+    with pytest.raises(SchemaError, match="callable"):
+        metric.quality_metrics(ws)
+
+
+def test_quality_metrics_empty_dict_rejected(ws):
+    metric.write_metric(ws, "METRICS = {}\n")
+    with pytest.raises(SchemaError, match="non-empty"):
+        metric.quality_metrics(ws)
+
+
+@pytest.mark.parametrize("reserved", ["cost_dollars", "latency_s"])
+def test_quality_metrics_collision_with_cost_objective(ws, reserved):
+    metric.write_metric(ws, f"def m(p, e):\n    return 1.0\nMETRICS = {{{reserved!r}: m}}\n")
+    with pytest.raises(SchemaError, match="cost objective"):
+        metric.quality_metrics(ws)
+
+
+def test_quality_metrics_neither_form_defined(ws):
+    metric.write_metric(ws, "def score(p, e):\n    return 1.0\n")
+    with pytest.raises(SchemaError, match="metric"):
+        metric.quality_metrics(ws)
+
+
+def test_primary_name_single_metric(ws):
+    metric.write_metric(ws, EXACT)
+    assert metric.primary_name(ws) == "quality"
+
+
+def test_primary_name_defaults_to_first_metric_key(ws):
+    metric.write_metric(ws, MULTI)
+    assert metric.primary_name(ws) == "exact"
+
+
+def test_primary_name_uses_approved_primary(ws):
+    metric.write_metric(ws, MULTI)
+    metric.approve(ws, "tester", primary="graded")
+    assert metric.primary_name(ws) == "graded"
+
+
+def test_primary_name_falls_back_when_approval_primary_invalid(ws):
+    metric.write_metric(ws, MULTI)
+    metric.approve(ws, "tester", primary="graded")
+    record = json.loads(ws.metric_approval.read_text())
+    record["primary"] = "ghost"  # names a metric that isn't defined
+    ws.metric_approval.write_text(json.dumps(record))
+    assert metric.primary_name(ws) == "exact"
+
+
+def test_approve_primary_must_name_a_defined_metric(ws):
+    metric.write_metric(ws, MULTI)
+    with pytest.raises(SchemaError, match="primary"):
+        metric.approve(ws, "tester", primary="nonexistent")
+    assert not ws.metric_approval.exists()
+
+
+def test_approve_records_primary_and_none(ws):
+    metric.write_metric(ws, MULTI)
+    metric.approve(ws, "tester", primary="graded")
+    assert json.loads(ws.metric_approval.read_text())["primary"] == "graded"
+    metric.write_metric(ws, EXACT)
+    metric.approve(ws, "tester")
+    assert json.loads(ws.metric_approval.read_text())["primary"] is None
+
+
+def test_changing_primary_does_not_change_metric_sha(ws):
+    metric.write_metric(ws, MULTI)
+    metric.approve(ws, "tester", primary="exact")
+    sha = metric.metric_sha(ws)
+    metric.approve(ws, "tester", primary="graded")
+    assert metric.metric_sha(ws) == sha  # primary is config, not code
+
+
+def test_load_metric_returns_primary_callable(ws):
+    metric.write_metric(ws, MULTI)
+    metric.approve(ws, "tester", primary="graded")
+    fn = metric.load_metric(ws)
+    assert fn("a", "b") == 0.5  # the 'graded' primary
+    metric.approve(ws, "tester", primary="exact")
+    assert metric.load_metric(ws)("a", "b") == 0.0  # now the 'exact' primary
+
+
+def test_demonstrate_multi_metric_scores_all_with_primary_mirror(ws):
+    metric.write_metric(ws, MULTI)
+    metric.approve(ws, "tester", primary="graded")
+    demo = metric.demonstrate(ws, [("a", "a"), ("a", "b")])
+    assert demo == [
+        {"predicted": "a", "expected": "a",
+         "scores": {"exact": 1.0, "graded": 0.5}, "score": 0.5},
+        {"predicted": "a", "expected": "b",
+         "scores": {"exact": 0.0, "graded": 0.5}, "score": 0.5},
+    ]

@@ -13,7 +13,6 @@ import hashlib
 import importlib.util
 import json
 import os
-import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -62,44 +61,37 @@ def metric_sha(workspace) -> str | None:
 
 
 def scores_skeleton(sha: str | None) -> dict:
-    """The empty scores.json structure, tied to the given metric sha."""
-    return {"metric_sha": sha, "candidates": {}, "val_scored": [], "flags": {}}
+    """The empty scores.json structure, tied to the given metric sha.
+
+    ``objectives`` (name -> "max"/"min") and ``primary`` are the multi-objective
+    additions; they stay empty/None until an ``evaluate`` populates them.
+    """
+    return {
+        "metric_sha": sha,
+        "objectives": {},
+        "primary": None,
+        "candidates": {},
+        "val_scored": [],
+        "flags": {},
+    }
 
 
 def invalidate_scores(workspace, new_sha: str | None) -> None:
-    """Archive scores.json to scores.archive/<k>.json and reset it to a skeleton.
+    """Reconcile scores.json to a changed metric — recover from cache, else archive.
 
     Called when the metric changes — by :func:`write_metric` here and by
-    ``scoring.load_scores`` (whoever notices the change first clears). Scores
-    recorded under different metrics are never comparable, so keeping them
-    live would let a metric edit silently rewrite history; archiving preserves
-    the old numbers for forensics while making clear they no longer count.
+    ``scoring.load_scores`` (whoever notices the change first). Candidates whose
+    outputs are still cached are re-scored under the new metric for free; only
+    candidates whose cache is stale or absent are unrecoverable, so those are
+    archived to scores.archive/ and warned about (scores under different metrics
+    are never comparable). Cost/latency objectives survive untouched. The heavy
+    lifting lives in ``scoring.reconcile_metric_change`` (it owns the outputs
+    cache and the objective aggregation); this thin wrapper avoids a circular
+    import at module load.
     """
-    path = Path(workspace.scores_json)
-    old: dict | None = None
-    if path.exists():
-        try:
-            old = json.loads(path.read_text())
-        except json.JSONDecodeError:
-            old = None
-    if old and old.get("candidates"):
-        archive_dir = Path(workspace.root) / "scores.archive"
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        k = 0
-        while (archive_dir / f"{k}.json").exists():
-            k += 1
-        dest = archive_dir / f"{k}.json"
-        dest.write_text(json.dumps(old, indent=2) + "\n")
-        msg = (
-            f"metric.py changed: {len(old['candidates'])} candidate score set(s) "
-            f"recorded under the previous metric were archived to {dest} and "
-            f"scores.json was reset. Scores under different metrics are never "
-            f"comparable — re-approve the new metric, then re-evaluate candidates "
-            f"under it."
-        )
-        print(msg)
-        warnings.warn(msg, UserWarning, stacklevel=2)
-    path.write_text(json.dumps(scores_skeleton(new_sha), indent=2) + "\n")
+    from . import scoring
+
+    scoring.reconcile_metric_change(workspace, new_sha)
 
 
 def write_metric(workspace, code: str) -> None:
@@ -185,14 +177,23 @@ def ensure_approved(workspace) -> None:
     )
 
 
-def approve(workspace, approved_by: str, weights: dict | None = None) -> None:
+def approve(
+    workspace,
+    approved_by: str,
+    weights: dict | None = None,
+    primary: str | None = None,
+) -> None:
     """Record sign-off for the current metric.py.
 
     Stamps the file's first line with ``# metric.py — approved by {who} on
     {date}`` (replacing any previous stamp) and writes metric_approval.json
     pinning the resulting sha, so any later edit to the file is detectable.
     ``weights`` records the per-field aggregate weighting for multi-output
-    programs — that weighting is part of the sign-off.
+    programs — that weighting is part of the sign-off. ``primary`` names which
+    quality metric is the headline (ranking/activation driver); it must name a
+    metric defined in metric.py (or be None to let :func:`primary_name` choose).
+    Both ``primary`` and ``weights`` are config, not code — changing them never
+    changes ``metric_sha`` and so never invalidates recorded scores.
     """
     path = Path(workspace.metric_py)
     if not path.exists():
@@ -202,6 +203,16 @@ def approve(workspace, approved_by: str, weights: dict | None = None) -> None:
             "would be meaningless — write the metric first (write_metric or "
             "harness.propose_metric), then approve it."
         )
+    if primary is not None:
+        metrics = quality_metrics(workspace)
+        if primary not in metrics:
+            raise SchemaError(
+                f"primary={primary!r} does not name a quality metric defined in "
+                f"metric.py (defined: {sorted(metrics)}). The primary is the "
+                f"headline metric that drives ranking and the default activation, "
+                f"so it must be one of the metrics being scored. Name a defined "
+                f"metric, or pass primary=None to use the sole/first one."
+            )
     now = datetime.now(timezone.utc)
     header = f"{_STAMP_PREFIX} {approved_by} on {now:%Y-%m-%d}"
     lines = path.read_text().splitlines()
@@ -215,16 +226,64 @@ def approve(workspace, approved_by: str, weights: dict | None = None) -> None:
         "approved_by": approved_by,
         "approved_at": now.isoformat(),
         "weights": weights,
+        "primary": primary,
     }
     Path(workspace.metric_approval).write_text(json.dumps(record, indent=2) + "\n")
 
 
-def load_metric(workspace) -> Callable:
-    """Import the workspace's metric.py by path and return its metric() callable.
+def _cost_objective_names() -> tuple[str, ...]:
+    """The reserved cost-objective names a quality metric may not shadow."""
+    from . import scoring
 
-    Cached by (path, sha), so editing the file yields a fresh import. Loading
-    does not require approval — :func:`demonstrate` uses it during the
-    sign-off conversation; scoring goes through :func:`ensure_approved` first.
+    return tuple(scoring.COST_OBJECTIVES)
+
+
+def _validate_metric_names(metrics: dict) -> None:
+    """Reject empty, non-callable, or cost-colliding quality metric names."""
+    reserved = set(_cost_objective_names())
+    for name, fn in metrics.items():
+        if not isinstance(name, str) or not name.strip():
+            raise SchemaError(
+                f"metric.py defines a quality metric with a non-string or empty "
+                f"name ({name!r}); every objective needs a real name so its scores "
+                f"can be stored and ranked. Give each METRICS key a non-empty name."
+            )
+        if not callable(fn):
+            raise SchemaError(
+                f"metric.py's METRICS[{name!r}] is not callable; each quality "
+                f"metric must be a function metric(predicted, expected). Point the "
+                f"key at a callable."
+            )
+        if name in reserved:
+            raise SchemaError(
+                f"metric name {name!r} collides with a built-in cost objective "
+                f"({sorted(reserved)}); cost_dollars and latency_s are measured "
+                f"automatically off every run, so a quality metric cannot reuse "
+                f"those names. Rename the metric."
+            )
+
+
+def _import_metric_module(workspace, path: Path, sha: str):
+    spec = importlib.util.spec_from_file_location(f"_ap_metric_{sha[:16]}", path)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise SchemaError(
+            f"metric.py failed to import ({exc!r}). The metric must be a "
+            f"self-contained module defining metric(predicted, expected) (or a "
+            f"METRICS dict of them); fix the error, then re-approve the file."
+        ) from exc
+    return module
+
+
+def quality_metrics(workspace) -> dict[str, Callable]:
+    """The workspace's named quality metrics: ``{name: callable}``.
+
+    A single ``def metric(predicted, expected)`` becomes ``{"quality": metric}``;
+    a ``METRICS = {"<name>": callable, ...}`` dict is returned as-is (and wins if
+    both are present). Cached by (path, sha) so editing the file yields a fresh
+    import. Raises SchemaError on bad/colliding names or if neither form exists.
     """
     path = Path(workspace.metric_py)
     sha = metric_sha(workspace)
@@ -238,40 +297,79 @@ def load_metric(workspace) -> Callable:
     cached = _METRIC_CACHE.get(key)
     if cached is not None:
         return cached
-    spec = importlib.util.spec_from_file_location(f"_ap_metric_{sha[:16]}", path)
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    except Exception as exc:
+    module = _import_metric_module(workspace, path, sha)
+    metrics_attr = getattr(module, "METRICS", None)
+    single = getattr(module, "metric", None)
+    if metrics_attr is not None:
+        if not isinstance(metrics_attr, dict) or not metrics_attr:
+            raise SchemaError(
+                "metric.py defines METRICS but it is not a non-empty dict of "
+                "{name: callable}. The multi-metric form is a dict of named "
+                "quality metrics; make it a non-empty dict, or delete it and "
+                "define a single def metric(predicted, expected)."
+            )
+        result = dict(metrics_attr)
+    elif callable(single):
+        result = {"quality": single}
+    else:
         raise SchemaError(
-            f"metric.py failed to import ({exc!r}). The metric must be a "
-            f"self-contained module defining metric(predicted, expected); fix "
-            f"the error, then re-approve the file."
-        ) from exc
-    fn = getattr(module, "metric", None)
-    if not callable(fn):
-        raise SchemaError(
-            "metric.py does not define a callable named metric. The scoring "
-            "contract is metric(predicted, expected) returning a float (or a "
-            "per-field dict for multi-output programs); define that function "
-            "and re-approve the file."
+            "metric.py does not define a callable named metric, nor a METRICS "
+            "dict of named metrics. The scoring contract is metric(predicted, "
+            "expected) returning a float (or a per-field dict for multi-output "
+            "programs); define that function (or a METRICS dict) and re-approve "
+            "the file."
         )
-    _METRIC_CACHE[key] = fn
-    return fn
+    _validate_metric_names(result)
+    _METRIC_CACHE[key] = result
+    return result
+
+
+def primary_name(workspace) -> str:
+    """The approved primary quality metric's name.
+
+    The approval record's ``primary`` if set and it names a defined metric, else
+    the sole metric's name, else the first key of METRICS (insertion order).
+    """
+    metrics = quality_metrics(workspace)
+    approval = _read_approval(workspace)
+    if approval is not None:
+        primary = approval.get("primary")
+        if primary in metrics:
+            return primary
+    return next(iter(metrics))
+
+
+def load_metric(workspace) -> Callable:
+    """The PRIMARY quality metric's callable (back-compat single-metric handle).
+
+    Existing callers (``harness.run``, ``demonstrate``) score against the one
+    headline metric; multi-metric evaluation goes through
+    :func:`quality_metrics`. Loading does not require approval.
+    """
+    return quality_metrics(workspace)[primary_name(workspace)]
 
 
 def demonstrate(workspace, examples: list[tuple]) -> list[dict]:
-    """Score (predicted, expected) pairs with the CURRENT metric.py.
+    """Score (predicted, expected) pairs under EVERY quality metric.
 
     Works whether or not the metric is approved — this is what feeds the
     sign-off conversation, where the user checks the scores against their
-    intuition of "good" before anything optimizes them.
+    intuition of "good" before anything optimizes them. Each row carries a
+    ``scores`` dict (one entry per quality metric) and a back-compat ``score``
+    equal to the primary metric's value.
     """
-    fn = load_metric(workspace)
-    return [
-        {"predicted": predicted, "expected": expected, "score": fn(predicted, expected)}
-        for predicted, expected in examples
-    ]
+    metrics = quality_metrics(workspace)
+    primary = primary_name(workspace)
+    rows: list[dict] = []
+    for predicted, expected in examples:
+        scores = {name: fn(predicted, expected) for name, fn in metrics.items()}
+        rows.append({
+            "predicted": predicted,
+            "expected": expected,
+            "scores": scores,
+            "score": scores[primary],
+        })
+    return rows
 
 
 def score_pair(

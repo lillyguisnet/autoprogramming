@@ -42,21 +42,32 @@ prg.data          # SplitView(train=<n>, val=<n>)
 
 ## Metric first: `propose_metric`
 
-No scoring happens until the workspace's `metric.py` is approved.
+No scoring happens until the workspace's `metric.py` is approved. Metrics are a
+**set of lenses**: every candidate is scored on all of them from a single run,
+so extra quality metrics cost ~no model calls.
 
 ```py
-prg.propose_metric(code: str, examples: list[tuple], note: str = "") -> bool | str
+prg.propose_metric(code: str, examples: list[tuple],
+                   note: str = "", primary: str | None = None) -> bool | str
 ```
 
-- `code` — full source of `metric.py`. Contract:
-  - single-output program: `def metric(predicted, expected) -> float`
-    (called with the bare output values);
-  - multi-output program: `def metric(predicted: dict, expected: dict) -> dict`
-    keyed by output type names — one score per output, no field may be missing.
+- `code` — full source of `metric.py`, in either form:
+  - **single** quality metric — `def metric(predicted, expected)`. For a
+    single-output program it returns a float (called with the bare output
+    values); for a multi-output program a dict keyed by output type names — one
+    score per output, no field may be missing. Its objective name is `"quality"`.
+  - **multi** — `METRICS = {"<name>": fn, ...}`, a dict of named quality metrics,
+    each following the same per-metric contract. Names must be non-empty, unique,
+    and must not collide with the cost objectives `cost_dollars` / `latency_s`
+    (else `SchemaError`). If both `metric` and `METRICS` are present, `METRICS`
+    wins.
 - `examples` — `(predicted, expected)` pairs (bare values for single-output,
-  dicts for multi-output) scored with the candidate metric and shown as a
-  demonstration table. Pick 3+ that show its judgment: an exact match, a near
-  miss (synonym/rounding), a clear failure.
+  dicts for multi-output) scored under **every** quality metric and shown as a
+  demonstration table (one column per metric, primary marked). Pick 3+ that show
+  their judgment: an exact match, a near miss (synonym/rounding), a clear failure.
+- `primary` — the name of the headline quality metric that drives val ranking,
+  the default activation, and the top-line number. `None` lets the library pick
+  (the sole metric, else the first `METRICS` key).
 - Returns `True` once approved (interactive terminal sign-off, or the
   `AP_AUTO_APPROVE_METRIC` env var — see below). Returns the user's feedback
   **string** when they push back: revise the code and propose again. Raises
@@ -66,10 +77,12 @@ prg.propose_metric(code: str, examples: list[tuple], note: str = "") -> bool | s
 
 ```py
 import autoprogramming as apm
-apm.metric.approve(prg.workspace, "user name", weights=None)
+apm.metric.approve(prg.workspace, "user name", weights=None, primary="chrF")
+# primary — which quality metric is the headline; must name a defined metric
+#   (or None). Config, not code: changing it never invalidates scores.
 # weights (multi-output only): {"Answer": 2.0, "Confidence": 1.0} — the per-field
-# aggregate weighting, part of the sign-off; must sum positive. Aggregate score
-# is the weighted mean of the per-field scores.
+#   aggregate weighting, part of the sign-off; must sum positive. Aggregate score
+#   is the weighted mean of the per-field scores.
 ```
 
 Facts that matter:
@@ -78,11 +91,16 @@ Facts that matter:
   (`# metric.py — approved by <who> on <date>`) and pins the file's sha in
   `metric_approval.json`. The stamp line is excluded from the sha, so
   re-approving never looks like a metric change.
-- **Editing `metric.py` after scores exist archives `scores.json`** to
-  `scores.archive/<k>.json` and resets it — scores under different metrics are
-  never comparable — and voids the approval (`MetricChangedError` on the next
-  scoring attempt until re-approved). Re-proposing byte-identical code is a
+- **Editing a metric's code re-scores from cached outputs, it does not wipe.**
+  On a `metric.py` code change, every candidate whose outputs are still cached is
+  re-scored under the new metric for **free** (no re-runs, no budget charge); only
+  candidates whose own code changed (stale cache) or that were never cached are
+  archived to `scores.archive/<k>.json` and warned about. Cost/latency objectives
+  survive untouched. The edit still voids the approval (`MetricChangedError` on the
+  next scoring attempt until re-approved). Re-proposing byte-identical code is a
   no-op that keeps everything.
+- **Primary and weights are config, not code.** Changing which metric is primary,
+  or re-weighting, never changes `metric_sha` and so never invalidates a score.
 - `AP_AUTO_APPROVE_METRIC=1` (or `true`/`yes`) auto-approves an unapproved
   metric for unattended runs. It never re-approves a metric that changed after
   sign-off. Do not set it to dodge the sign-off conversation with a present user.
@@ -181,11 +199,25 @@ prg.eval(candidate, split="val", per_instance=False, n_repeats=None) -> EvalRepo
   `eval_calls` and dollars to the ledger.
 - Metric must be approved or this raises before any spend.
 
-`EvalReport` fields: `candidate`, `split`, `mean`, `std`,
+Every eval is **multi-objective**: the single run per (row, repeat) is scored
+under every quality metric, and `cost_dollars` + `latency_s` are read off the
+same run (lower is better). Extra quality metrics therefore add no runs.
+
+`EvalReport` fields — the top-level ones are the **primary** quality metric's,
+exactly as before: `candidate`, `split`, `mean`, `std`,
 `ci95: (lo, hi)` (seeded bootstrap over per-row means), `n_rows`, `n_repeats`,
 `repeat_variance`, `per_row` (train + `per_instance=True` only, else `None`),
 `per_field` (multi-output aggregates or `None`), `errors` (failed-run
-summaries; failed runs score 0.0), `flags` (memorization flags, see below).
+summaries; failed runs score 0.0 on every quality metric), `flags` (memorization
+flags, see below). Plus:
+
+- `primary` — the name of the headline quality metric.
+- `objectives: dict[str, dict]` — every objective (each quality metric, plus
+  `cost_dollars` and `latency_s`), each `{"mean", "std", "ci95", "per_field"}`.
+
+`print(report)` shows the primary headline line, then one indented line per other
+objective with its goal (`max` for quality, `min` for cost/latency) and CI —
+cost as dollars, latency in seconds.
 
 ## Trace: `run`
 
@@ -202,20 +234,47 @@ out-of-range row raises `IndexError`. Charges 1 eval call.
 ## Compare: `compare`
 
 ```py
-prg.compare(a, b, split="val") -> CompareReport
+prg.compare(a, b, split="val", objective=None) -> CompareReport
 ```
 
 Paired comparison over per-row scores **already stored** by `eval()` — never
 triggers new spend. `a` is the baseline, `b` the challenger; `diff_mean` is
 the mean of `b - a` per row; `ci95` is a seeded paired-bootstrap CI;
-`improved` is `True` only when the CI lies entirely above zero. Raises
+`improved` is direction-aware — `True` only when the CI excludes zero on the
+better side: entirely **above** zero for a maximized quality metric, entirely
+**below** zero for a minimized `cost_dollars` / `latency_s` objective (a
+reliably cheaper or faster challenger). `CompareReport.goal` records which. Raises
 `DataDisciplineError` when either candidate has no stored per-row scores for
 that split, or their stored rows share no ids — eval both first. (Per-row val
 scores are persisted internally for exactly this pairing; they are never
 returned to you.)
 
+- `objective=None` (default) compares the **primary** quality metric — the
+  back-compat default.
+- `objective="<name>"` compares any other objective's stored per-row scores: a
+  named quality metric, or `"cost_dollars"` / `"latency_s"`. The refusal message
+  names the objective if either candidate lacks stored scores for it.
+
 **"Improved" means the CI excludes zero.** A point estimate going up is not a
-win; do not keep a mutation `compare()` cannot distinguish from noise.
+win; do not keep a mutation `compare()` cannot distinguish from noise. (For a
+cost objective the boolean still means the CI of `b - a` is above zero — i.e.
+`b` costs MORE; read the sign, don't just trust the flag.)
+
+## Tradeoffs: `tradeoffs`
+
+```py
+prg.tradeoffs(split="val") -> TradeoffReport
+```
+
+The quality/cost Pareto frontier over every candidate with stored objective
+vectors for the split. `rows` is one dict per candidate
+(`{"candidate", "objectives": {name: mean}, "dominated": bool}`), sorted by the
+primary metric descending; `nondominated` lists the frontier — candidates no
+other candidate beats on **every** objective (quality maximized, cost minimized).
+`print(report)` renders a compact table, one column per objective, a `*` on
+frontier members. Read it during the loop to see where each candidate sits on the
+quality/cost curve and drop the dominated dead ends. Cost as dollars, latency in
+seconds.
 
 ## Survey: `frontier`
 
@@ -244,18 +303,29 @@ The **only** code path that reads the test split, run once per workspace:
 2. Takes the `top_k` eligible candidates by val mean and evaluates each on
    every test row (1 repeat if deterministic, else 3). Charges the budget but
    never checks it — the report card happens even on an exhausted budget.
-3. Demotes any finalist whose val-to-test drop exceeds
+3. Scores every finalist on **all objectives** from the shared test runs
+   (quality metrics + `cost_dollars` + `latency_s`) and computes the Pareto
+   frontier over those TEST objective vectors.
+4. Demotes any finalist whose val-to-test drop (on the **primary**) exceeds
    `max(0.05, half the width of its val CI)` — that is overfitting to val,
    reported loudly, never hidden.
-4. Activates the best test scorer among the non-demoted (best test overall if
-   all were demoted, with a warning note), writes `final_report.json`, and
+5. Activates the **best-primary candidate that is on the frontier and not
+   demoted** (fallbacks: best-primary on the frontier, then best primary overall
+   with a loud note — always exactly one). Writes `final_report.json` and
    rewrites `active.json` + `pyproject.toml` so the shipped package runs the
    winner with exactly its runtime deps.
 
 `FinalReport`: `entries` (per finalist: `candidate`, `val_mean`, `test_mean`,
-`gap`, `demoted`, `note`), `activated`, and `val_reliability` — `"ok"`,
-`"warn"` (val absorbed many selection decisions; noisy), or `"unreliable"`
-(val scores must not be quoted; the test column is the only report card).
+`gap`, `demoted`, `note` — all **primary**, back-compat — plus
+`objectives: {name: mean}` and `frontier: bool`), `activated`,
+`val_reliability` (`"ok"` / `"warn"` / `"unreliable"`), and `frontier`
+(the list of nondominated finalists). `print(report)` keeps the legacy
+"test scores (evaluated once):" and "activated:" lines, then appends a
+"quality / cost tradeoffs:" table (a `*` on frontier members) and a closing line
+naming the activated default and the cheaper/faster frontier alternatives with
+the exact `ws.activate("<name>", <primary test mean>)` call to switch. Present
+that frontier to the user — do not hand them only the single most-accurate
+candidate.
 
 Calling `finalize()` a second time raises `FinalizedError` — a second pass
 would let the report card steer the search and turn test into another val
@@ -290,18 +360,26 @@ Soft signals (warnings, not errors):
 
 ## The loop
 
-1. **Metric sign-off first** — `propose_metric` before any eval; changing it
-   later wipes every recorded score.
-2. **Seed** a complete working candidate; `prg.eval("candidate_0")` for a val
-   baseline.
-3. **Reflect on train**: `prg.eval(name, split="train", per_instance=True)` to
-   find the worst rows; `prg.run(name, split="train", row=i)` to read their
-   traces; form a hypothesis.
-4. **Mutate**: `prg.new_candidate(from_=best)`, edit the file, eval. Keep it
-   only if `prg.compare(best, new).improved` is `True`.
-5. **Watch the budget**: check `prg.budget` between iterations and stop
-   cleanly before it runs dry. Stop early when improvements stop separating
-   from noise. Explore genuinely different approaches (LLM prompt, rules,
-   classical ML, local model, pipeline) — `frontier()` shows which rows each
-   approach wins.
-6. **`prg.finalize()`** — one-time test eval, activation, sealed report.
+0. **Metric set + primary sign-off** — `propose_metric(code, examples,
+   primary=...)` before any eval. Add a graded lens if a strict one gives a
+   family a flat, zero-gradient score. Editing metric code later re-scores from
+   cache; changing primary/weights invalidates nothing.
+1. **Survey the ladder, seed a diverse portfolio.** Check current tools (do not
+   trust remembered "latest" models), then create several genuinely distinct
+   candidates across cost tiers — a model call, a classical head, a rules
+   baseline, a pretrained-model-as-a-stage pipeline — breadth before depth.
+2. **Baseline the portfolio on val**, then read `prg.tradeoffs()` to see where
+   each lands on the quality/cost frontier. Drop dominated dead ends; record why
+   a family was dropped as a scored result, not a hunch.
+3. **Deepen the promising tiers.** Compose (cascade, ensemble, router,
+   learned-feature + classical-head), tune, and try a second config before
+   dismissing a family. Reflect on train: `prg.eval(name, split="train",
+   per_instance=True)` for the worst rows, `prg.run(name, split="train", row=i)`
+   for their traces, `prg.frontier()` for which candidate wins which rows. Keep a
+   mutation only if `prg.compare(best, new).improved` is `True`.
+4. **Watch the frontier, not one number.** Check `prg.budget` between iterations
+   and stop when the quality/cost frontier stops advancing (a new candidate no
+   longer joins or displaces it), not merely when a single metric plateaus.
+5. **`prg.finalize()`** — one-time test eval, activation of the best-primary
+   frontier default, sealed report. Present the tradeoff frontier and the
+   one-liner to switch to a cheaper/faster alternative.

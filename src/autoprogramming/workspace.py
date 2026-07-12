@@ -338,6 +338,16 @@ class Workspace:
         return p
 
     @property
+    def outputs_dir(self) -> Path:
+        """``.ap/outputs/`` — cached candidate run outputs (created on write).
+
+        Reuses the ``.ap/`` scratch tree; the outputs cache lets a metric edit
+        re-score cached predictions instead of re-running candidates. Pure path
+        (no mkdir) so accessing it never materializes ``.ap/`` prematurely.
+        """
+        return self.root / ".ap" / "outputs"
+
+    @property
     def schema_py(self) -> Path:
         """Generated ``schema.py`` — the immutable program definition."""
         return self.root / "schema.py"

@@ -12,7 +12,7 @@ import getpass
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import candidates as candidates_mod
 from . import data as data_mod
@@ -24,7 +24,13 @@ from .candidates import Candidate
 from .errors import FinalizedError, MetricNotApprovedError, NotOptimizedError
 from .runner import RunResult, run_candidate
 from .schema import Schema
-from .scoring import CompareReport, EvalReport
+from .scoring import (
+    COST_OBJECTIVES,
+    CompareReport,
+    EvalReport,
+    TradeoffReport,
+    _format_objective,
+)
 from .workspace import Workspace
 
 
@@ -81,11 +87,19 @@ class FrontierReport:
 
 @dataclass
 class FinalReport:
-    """The final report card — test scores, demotions, activation."""
+    """The final report card — test scores, demotions, activation, tradeoffs.
+
+    The primary quality metric drives the "test scores" block, the demotion
+    logic, and the activated default (all as before). ``frontier`` names the
+    Pareto-nondominated finalists over the full TEST objective vector (quality
+    maximized, cost/latency minimized); each entry carries its ``objectives``
+    means and a ``frontier`` flag so the tradeoff table can be rendered.
+    """
 
     entries: list[dict]
     activated: str | None
     val_reliability: str
+    frontier: list[str] = field(default_factory=list)
 
     def __str__(self) -> str:
         lines = ["test scores (evaluated once):"]
@@ -98,6 +112,7 @@ class FinalReport:
                 "treat these numbers with suspicion."
             )
         lines.append(f"activated: {self.activated if self.activated else '(none)'}")
+        lines.extend(self._tradeoff_block())
         if self.val_reliability == "warn":
             lines.append(
                 "note: val absorbed many selection decisions relative to its "
@@ -111,12 +126,52 @@ class FinalReport:
             )
         return "\n".join(lines)
 
+    def _tradeoff_block(self) -> list[str]:
+        objective_entries = [e for e in self.entries if e.get("objectives")]
+        if not objective_entries:
+            return []
+        obj_names = list(objective_entries[0]["objectives"].keys())
+        header = ["", "candidate", *obj_names]
+        table = [header]
+        for e in objective_entries:
+            mark = "*" if e["candidate"] in self.frontier else " "
+            table.append([
+                mark, e["candidate"],
+                *[_format_objective(n, e["objectives"][n]) for n in obj_names],
+            ])
+        widths = [max(len(row[i]) for row in table) for i in range(len(header))]
+        rendered = [
+            "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row))
+            for row in table
+        ]
+        lines = ["", "quality / cost tradeoffs:", *rendered]
+        alts = [
+            e for e in objective_entries
+            if e["candidate"] in self.frontier and e["candidate"] != self.activated
+        ]
+        if alts:
+            names = ", ".join(
+                f"{e['candidate']} (ws.activate({e['candidate']!r}, {e['test_mean']:.4g}))"
+                for e in alts
+            )
+            lines.append(
+                f"activated {self.activated} as the best-primary frontier default; "
+                f"cheaper/faster frontier alternatives: {names}"
+            )
+        else:
+            lines.append(
+                f"activated {self.activated}; it is the only candidate on the "
+                f"quality/cost frontier"
+            )
+        return lines
+
     def to_dict(self) -> dict:
         """JSON-serializable form (what final_report.json stores)."""
         return {
             "entries": self.entries,
             "activated": self.activated,
             "val_reliability": self.val_reliability,
+            "frontier": self.frontier,
         }
 
 
@@ -223,23 +278,38 @@ class AgentHarness:
         ]
         return FrontierReport(rows=rows_report, nondominated=nondominated, missing=missing)
 
-    def compare(self, a: str, b: str, split: str = "val") -> CompareReport:
-        """Paired comparison of two candidates' stored per-row scores."""
-        return scoring.compare(self._workspace, a, b, split=split)
+    def compare(self, a: str, b: str, split: str = "val",
+                objective: str | None = None) -> CompareReport:
+        """Paired comparison of two candidates' stored per-row scores.
 
-    def propose_metric(self, code: str, examples: list[tuple], note: str = "") -> bool | str:
-        """Write a metric, demonstrate it on examples, and seek sign-off.
+        ``objective=None`` compares the primary quality metric; pass an
+        objective name (a quality metric, ``cost_dollars`` or ``latency_s``) to
+        compare on that objective's stored per-row scores instead.
+        """
+        return scoring.compare(self._workspace, a, b, split=split, objective=objective)
 
-        Returns True once approved; returns the user's feedback string when
-        they push back (the agent iterates); raises MetricNotApprovedError
-        when nobody can approve (no terminal, no AP_AUTO_APPROVE_METRIC).
+    def tradeoffs(self, split: str = "val") -> TradeoffReport:
+        """The quality/cost Pareto frontier over evaluated candidates."""
+        return scoring.tradeoffs(self._workspace, split=split)
+
+    def propose_metric(self, code: str, examples: list[tuple], note: str = "",
+                       primary: str | None = None) -> bool | str:
+        """Write a metric set, demonstrate it on examples, and seek sign-off.
+
+        ``code`` may define a single ``metric`` or a ``METRICS`` dict; the demo
+        table shows one column per quality metric so the user signs off on the
+        whole set at once, with ``primary`` (the headline metric) marked.
+        Returns True once approved; returns the user's feedback string when they
+        push back (the agent iterates); raises MetricNotApprovedError when
+        nobody can approve (no terminal, no AP_AUTO_APPROVE_METRIC).
         """
         ws = self._workspace
         metric_mod.write_metric(ws, code)
         demo = metric_mod.demonstrate(ws, examples)
-        table = _demo_table(demo)
+        effective_primary = _effective_primary(ws, primary)
+        table = _demo_table(demo, effective_primary)
         if _auto_approve_enabled():
-            metric_mod.approve(ws, "auto (AP_AUTO_APPROVE_METRIC)")
+            metric_mod.approve(ws, "auto (AP_AUTO_APPROVE_METRIC)", primary=primary)
             return True
         if sys.stdin.isatty():
             print(table)
@@ -247,7 +317,7 @@ class AgentHarness:
                 print(note)
             answer = input("Do these scores match your intuition of 'good'? [y/N or feedback] ")
             if answer.strip().lower() in ("y", "yes"):
-                metric_mod.approve(ws, getpass.getuser())
+                metric_mod.approve(ws, getpass.getuser(), primary=primary)
                 return True
             return answer
         raise MetricNotApprovedError(
@@ -319,32 +389,35 @@ class AgentHarness:
 
         schema = ws.schema
         test_rows = data_mod.load_split(ws, "test")
-        metric_fn = metric_mod.load_metric(ws)
+        metrics = metric_mod.quality_metrics(ws)
+        primary = metric_mod.primary_name(ws)
         weights = _approval_weights(ws)
         ledger = BudgetLedger(ws.budget_json) if ws.budget_json.exists() else None
 
+        expected_by_row = {
+            f"row_{i}": schema.coerce_expected(r) for i, r in enumerate(test_rows)
+        }
         entries: list[dict] = []
         for name in top:
             cand = candidates_mod.load_candidate(ws, name)
             n_repeats = 1 if cand.deterministic else scoring.DEFAULT_REPEATS
-            row_means: list[float] = []
-            for row_dict in test_rows:
+            cache_rows: dict[str, list[dict]] = {}
+            for i, row_dict in enumerate(test_rows):
                 inputs = schema.coerce_inputs(row_dict)
-                expected = schema.coerce_expected(row_dict)
-                repeat_scores: list[float] = []
+                reps_list: list[dict] = []
                 for _ in range(n_repeats):
                     result = run_candidate(ws, cand, inputs)
                     if ledger is not None:
                         ledger.charge(eval_calls=1, dollars=result.cost_dollars or 0.0)
-                    if result.ok:
-                        s, _ = metric_mod.score_pair(
-                            metric_fn, schema, result.outputs, expected, weights
-                        )
-                    else:
-                        s = 0.0
-                    repeat_scores.append(float(s))
-                row_means.append(sum(repeat_scores) / len(repeat_scores))
-            test_mean = sum(row_means) / len(row_means) if row_means else 0.0
+                    reps_list.append(scoring._run_cache_entry(result))
+                cache_rows[f"row_{i}"] = reps_list
+            scoring.write_output_cache(ws, cand, "test", cache_rows)
+            sub = scoring._aggregate_from_cache(
+                cache_rows, metrics, primary, schema, weights,
+                expected_by_row, n_repeats,
+            )
+            test_mean = sub["mean"]  # primary
+            objectives = {o: v["mean"] for o, v in sub["objectives"].items()}
 
             stats = _val_stats(scores, name)
             val_mean = float(stats["mean"])
@@ -362,11 +435,32 @@ class AgentHarness:
                 "gap": gap,
                 "demoted": demoted,
                 "note": note,
+                "objectives": objectives,
+                "frontier": False,
             })
 
         entries.sort(key=lambda e: (-e["test_mean"], _cand_key(e["candidate"])))
+
+        # Pareto frontier over the finalists' full TEST objective vectors
+        # (quality maximized, cost/latency minimized). Cost coordinates are
+        # rounded for domination so wall-clock latency jitter cannot flip which
+        # finalists are reported on the frontier run to run.
+        points = {e["candidate"]: e["objectives"] for e in entries}
+        goals = {name: "max" for name in metrics}
+        goals.update(COST_OBJECTIVES)
+        frontier = set(scoring.pareto_nondominated(
+            scoring._domination_points(points), goals
+        ))
+        for e in entries:
+            e["frontier"] = e["candidate"] in frontier
+
+        # Activate the best-primary candidate that is on the frontier and not
+        # demoted; fall back to best-primary on the frontier, then to best
+        # primary overall (loud note) — always exactly one activated.
         survivors = [e for e in entries if not e["demoted"]]
-        pool = survivors or entries
+        frontier_survivors = [e for e in survivors if e["frontier"]]
+        frontier_entries = [e for e in entries if e["frontier"]]
+        pool = frontier_survivors or frontier_entries or entries
         winner = min(pool, key=lambda e: (-e["test_mean"], _cand_key(e["candidate"])))
         if not survivors:
             winner["note"] += (
@@ -383,6 +477,7 @@ class AgentHarness:
             entries=entries,
             activated=winner["candidate"],
             val_reliability=val_reliability,
+            frontier=sorted(frontier, key=_cand_key),
         )
         ws.activate(winner["candidate"], winner["test_mean"])
         ws.mark_finalized(report.to_dict())
@@ -404,13 +499,41 @@ def _auto_approve_enabled() -> bool:
     return os.environ.get("AP_AUTO_APPROVE_METRIC", "").strip().lower() in ("1", "true", "yes")
 
 
-def _demo_table(demo: list[dict]) -> str:
+def _effective_primary(workspace, primary: str | None) -> str | None:
+    """The metric name that WILL be primary once approved (for the demo table)."""
+    try:
+        metrics = metric_mod.quality_metrics(workspace)
+    except Exception:
+        return primary
+    if primary in metrics:
+        return primary
+    return metric_mod.primary_name(workspace)
+
+
+def _fmt_metric_score(value) -> str:
+    return f"{value:.2f}" if isinstance(value, (int, float)) else repr(value)
+
+
+def _demo_table(demo: list[dict], primary: str | None = None) -> str:
+    """Render the metric demonstration: one column per quality metric.
+
+    Single-metric proposals keep the one-column shape; multi-metric proposals
+    show every metric's score on each example, with the primary metric marked,
+    so the user signs off on the whole set at once.
+    """
     lines = ["proposed metric on real examples:"]
+    names = list(demo[0].get("scores", {})) if demo else []
     for entry in demo:
-        score = entry["score"]
-        shown = f"{score:.2f}" if isinstance(score, (int, float)) else repr(score)
         lines.append(f"  expected:  {entry['expected']!r}")
-        lines.append(f"  predicted: {entry['predicted']!r}   -> {shown}")
+        scores = entry.get("scores")
+        if scores and len(names) > 1:
+            lines.append(f"  predicted: {entry['predicted']!r}")
+            for name in names:
+                tag = "  <- primary" if name == primary else ""
+                lines.append(f"      {name}: {_fmt_metric_score(scores[name])}{tag}")
+        else:
+            shown = _fmt_metric_score(entry.get("score"))
+            lines.append(f"  predicted: {entry['predicted']!r}   -> {shown}")
     return "\n".join(lines)
 
 

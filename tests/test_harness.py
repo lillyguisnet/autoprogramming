@@ -438,5 +438,138 @@ def test_final_report_str_flags_unreliable_val():
 def test_final_report_round_trips_to_dict():
     rep = harness.FinalReport(entries=[], activated=None, val_reliability="ok")
     d = rep.to_dict()
-    assert d == {"entries": [], "activated": None, "val_reliability": "ok"}
+    assert d == {
+        "entries": [], "activated": None, "val_reliability": "ok", "frontier": [],
+    }
     assert json.dumps(d)
+
+
+# ------------------------------------------------- multi-objective finalize
+
+
+MULTI_SRC = (
+    "def exact(predicted, expected):\n"
+    "    return 1.0 if predicted == expected else 0.0\n"
+    "def half(predicted, expected):\n"
+    "    return 0.5\n"
+    "METRICS = {'exact': exact, 'half': half}\n"
+)
+
+
+def approve_multi(ws, primary="exact"):
+    metric_mod.write_metric(ws, MULTI_SRC)
+    metric_mod.approve(ws, "tester", primary=primary)
+
+
+def test_finalize_reports_frontier_and_objectives(tmp_path):
+    ws = make_workspace(tmp_path)
+    approve_multi(ws, primary="exact")
+    h = harness.AgentHarness(ws)
+    h.new_candidate(source=GOOD_CANDIDATE)
+    h.new_candidate(source=BAD_CANDIDATE)
+    h.eval("candidate_0", n_repeats=1)
+    h.eval("candidate_1", n_repeats=1)
+
+    rep = h.finalize(top_k=2)
+
+    # best-primary candidate, on the frontier, not demoted -> activated
+    assert rep.activated == "candidate_0"
+    assert "candidate_0" in rep.frontier  # strictly best on the primary metric
+
+    e0 = next(e for e in rep.entries if e["candidate"] == "candidate_0")
+    assert set(e0["objectives"]) == {"exact", "half", "cost_dollars", "latency_s"}
+    assert e0["objectives"]["exact"] == 1.0
+    assert e0["objectives"]["half"] == 0.5
+    assert e0["frontier"] is True
+
+    # legacy lines still emitted verbatim, plus the new tradeoff block
+    lines = str(rep).splitlines()
+    assert lines[0] == "test scores (evaluated once):"
+    assert "  candidate_0: 1.00   (val was 1.00 — healthy gap)" in lines
+    assert "activated: candidate_0" in lines
+    assert "quality / cost tradeoffs:" in str(rep)
+
+    # to_dict / final_report.json round-trips the new fields
+    stored = json.loads(ws.final_report.read_text())
+    assert "candidate_0" in stored["frontier"]
+    entry0 = next(e for e in stored["entries"] if e["candidate"] == "candidate_0")
+    assert entry0["objectives"]["exact"] == 1.0
+    assert entry0["frontier"] is True
+
+
+def test_finalize_after_primary_switch_does_not_fabricate_demotion(tmp_path):
+    # Regression (critical): switching the primary metric after eval is config,
+    # not code, so it must re-mirror the stored val numbers. Otherwise finalize
+    # compares an old-primary val mean (exact = 1.0) against a new-primary test
+    # mean (half = 0.5) and fabricates an overfit demotion.
+    ws = make_workspace(tmp_path)
+    approve_multi(ws, primary="exact")
+    h = harness.AgentHarness(ws)
+    h.new_candidate(source=GOOD_CANDIDATE)
+    h.eval("candidate_0", n_repeats=1)
+
+    metric_mod.approve(ws, "tester", primary="half")  # switch primary (no code change)
+
+    rep = h.finalize(top_k=1)
+    e0 = next(e for e in rep.entries if e["candidate"] == "candidate_0")
+    assert e0["val_mean"] == 0.5       # val mirror followed the new primary
+    assert e0["test_mean"] == 0.5
+    assert e0["demoted"] is False      # no fabricated overfit demotion
+    assert "healthy gap" in e0["note"]
+    assert rep.activated == "candidate_0"
+
+
+def test_prg_tradeoffs_returns_frontier(tmp_path):
+    ws = make_workspace(tmp_path)
+    approve_multi(ws, primary="exact")
+    h = harness.AgentHarness(ws)
+    h.new_candidate(source=GOOD_CANDIDATE)
+    h.new_candidate(source=BAD_CANDIDATE)
+    h.eval("candidate_0", n_repeats=1)
+    h.eval("candidate_1", n_repeats=1)
+
+    tr = h.tradeoffs()
+    assert isinstance(tr, scoring_mod.TradeoffReport)
+    assert tr.split == "val"
+    assert "candidate_0" in tr.nondominated
+    names = [r["candidate"] for r in tr.rows]
+    assert set(names) == {"candidate_0", "candidate_1"}
+    assert names[0] == "candidate_0"  # sorted by the primary (exact) descending
+    assert "quality / cost tradeoffs on val" in str(tr)
+
+
+def test_compare_on_objective_delegates(tmp_path):
+    ws = make_workspace(tmp_path)
+    approve_multi(ws, primary="exact")
+    h = harness.AgentHarness(ws)
+    h.new_candidate(source=GOOD_CANDIDATE)
+    h.new_candidate(source=BAD_CANDIDATE)
+    h.eval("candidate_0", n_repeats=1)
+    h.eval("candidate_1", n_repeats=1)
+
+    cr = h.compare("candidate_0", "candidate_1", objective="half")
+    assert cr.objective == "half"
+    assert cr.diff_mean == pytest.approx(0.0)  # 'half' is constant 0.5 for both
+
+
+def test_propose_metric_multi_passes_primary(tmp_path, monkeypatch):
+    monkeypatch.setenv("AP_AUTO_APPROVE_METRIC", "1")
+    ws = make_workspace(tmp_path)
+    h = harness.AgentHarness(ws)
+    result = h.propose_metric(MULTI_SRC, [("A!", "A!"), ("A!", "B!")], primary="half")
+    assert result is True
+    assert metric_mod.primary_name(ws) == "half"
+    assert json.loads(ws.metric_approval.read_text())["primary"] == "half"
+
+
+def test_propose_metric_multi_table_shows_all_metrics(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("AP_AUTO_APPROVE_METRIC", raising=False)
+    monkeypatch.setattr("sys.stdin", FakeTTY())
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    ws = make_workspace(tmp_path)
+    h = harness.AgentHarness(ws)
+    result = h.propose_metric(MULTI_SRC, [("A!", "A!")], primary="exact")
+    assert result is True
+    out = capsys.readouterr().out
+    assert "exact" in out and "half" in out
+    assert "primary" in out

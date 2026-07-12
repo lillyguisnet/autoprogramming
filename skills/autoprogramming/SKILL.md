@@ -39,28 +39,38 @@ the optimizer figure out.
    library enforces this); fewer than 5 is refused outright. If none: offer to
    generate synthetic pairs the user validates.
 3. **What does "good" mean?** Exact match? Same meaning? Latency? Cost per
-   call? This shapes the metric you will propose.
-4. **Sign off on the metric.** THE critical step — the entire search optimizes
-   whatever the metric says, so a wrong metric produces a confidently-scored
-   wrong program. Never skip; never approve on the user's behalf. Demonstrate
-   the proposed metric on real examples and iterate until the scores match the
-   user's intuition:
+   call? Usually more than one of these — that is fine, they become a *set* of
+   metrics (below). This shapes the metric(s) you will propose.
+4. **Sign off on the metric set.** THE critical step — the entire search
+   optimizes whatever the metric says, so a wrong metric produces a
+   confidently-scored wrong program. Never skip; never approve on the user's
+   behalf. You may propose **several quality metrics at once** (a strict one and
+   a graded one, say); every candidate is scored on all of them from a single
+   run, so extra metrics cost ~nothing. Designate a **primary** — the headline
+   number that drives ranking and activation. Demonstrate the set on real
+   examples and iterate until the scores match the user's intuition:
 
    ```
-   I propose chrF for scoring. Watch it score three examples:
+   I propose two lenses: chrF (graded, primary) and exact-match (strict).
      expected:  "Où est la gare ?"
-     predicted: "Où se trouve la gare ?"  -> 0.81  (synonym, mild penalty)
-     predicted: "Où est la gare ?"        -> 1.00  (exact)
-     predicted: "La gare est fermée."     -> 0.34  (wrong meaning)
-   Does 0.81 for the synonymous phrasing match your intuition of "good"?
-   If synonyms should score ~1.0, I'll use embedding similarity instead.
+     predicted: "Où se trouve la gare ?"
+         chrF: 0.81  <- primary   exact: 0.00
+     predicted: "Où est la gare ?"
+         chrF: 1.00  <- primary   exact: 1.00
+     predicted: "La gare est fermée."
+         chrF: 0.34  <- primary   exact: 0.00
+   Does chrF 0.81 for the synonymous phrasing match your intuition of "good"?
+   If synonyms should score ~1.0, I'll swap chrF for embedding similarity.
    ```
 
    For multi-output programs the per-field aggregate weighting is also part of
-   the sign-off.
+   the sign-off. Which metric is primary, and any weights, are **config, not
+   code**: re-ranking or re-weighting later never wipes scores.
 5. **Any constraints?** Data allowed to leave the machine? Max cost per call?
    Offline only? Which packages may be installed? These narrow the candidate
-   search space.
+   search space. Cost and latency are measured automatically as objectives (see
+   below), so "under $0.001/call" or "under 100ms" become real selection
+   pressure, not just wishes.
 
 ## Define the program
 
@@ -140,13 +150,19 @@ What happens mechanically:
   everything needed to drive the loop yourself. Read
   [references/prg-api.md](references/prg-api.md) for the complete agent-side
   `prg` API before doing that.
-- The metric must be proposed, demonstrated on real examples, and approved
-  before any scoring happens. Changing the metric later archives and clears
-  all recorded scores — scores under different metrics are never comparable.
-- The optimizer loop is: reflect on **train** failures (full traces allowed),
-  mutate candidate files, select on **val** (aggregate scores only), repeat
-  within budget. **test** is untouchable until `finalize()` evaluates it once,
-  at the end, on the top candidates, and activates the winner.
+- The metric set must be proposed, demonstrated on real examples, and approved
+  before any scoring happens. Editing a metric's **code** later re-scores every
+  candidate from its cached outputs (free — no re-runs) and archives only
+  candidates whose own code changed and can't be recovered. Changing which
+  metric is **primary**, or re-weighting, touches nothing — it is config.
+- The optimizer loop is: survey the approach ladder and seed a **diverse
+  portfolio** across cost tiers, baseline it on **val** and read the
+  quality/cost frontier (`prg.tradeoffs()`), deepen and compose the promising
+  tiers by reflecting on **train** failures (full traces allowed) and selecting
+  on **val** (aggregate scores only), all within budget. **test** is
+  untouchable until `finalize()` evaluates it once, at the end, on the top
+  candidates, and activates the winner. See
+  [references/prg-api.md](references/prg-api.md) for the full loop.
 - Returns a `FinalReport` when candidates were scored; `None` when the
   workspace is awaiting a manual session.
 
@@ -158,11 +174,58 @@ translate.save("translate_ap")     # relocate the workspace (no-op if already th
 # and: pip install ./translate_ap  — deps of the active candidate install automatically
 ```
 
+## What the optimizer explores: the approach ladder
+
+A candidate is any `.py` file that satisfies the schema, so the search space is
+a whole cost/capability spectrum — from most expensive/capable to cheapest:
+
+1. Generalist harness (a coding agent / reasoning model doing the task live)
+2. A graph of several model calls (plan, act, critique, retrieve)
+3. A single model call with an optimized prompt
+4. A finetuned small model
+5. A specialized deep net (a task-specific pretrained model)
+6. Classical ML (a fitted scikit-learn head, gradient boosting, nearest neighbor)
+7. Hand-written features, rules, regex, or lookup logic
+
+The optimizer does not seed one idea and mutate it forever (the single-step
+trap). It seeds a **diverse portfolio across tiers first**, baselines all of
+them, then deepens the ones the data rewards — **breadth before depth**. It
+**composes across tiers**: the best solution is usually a compound system, using
+a heavy pretrained model as ONE STAGE (pipeline/decomposition, cascade, ensemble,
+router, learned-feature + classical-head), not only end to end. It does not
+dismiss a family on a single failed config, and it picks the **cheapest tier that
+can plausibly clear the bar**, climbing only when the data shows that tier's
+ceiling. Steer the user toward this: a rules candidate at 0.95 beats a model call
+at 0.90 when the CI separates and it never memorized.
+
+**Use current tools, not remembered ones.** Do not trust training memory for
+"the latest" model or library — it is stale. Before fetching a model or picking a
+package, check what is current (model hub, package index, a quick web search) and
+prefer the current best-for-cost; verify a model actually loads before building a
+candidate around it. The classic failure is reaching for an old version you
+remember (SAM 1 when a newer, smaller, faster SAM exists) instead of today's.
+
+## Cost is an objective — present the frontier, not one number
+
+`cost_dollars` and `latency_s` are measured on every candidate automatically
+(lower is better), independent of the metric. Every eval reports them next to the
+quality metrics, and `prg.tradeoffs()` shows the quality/cost Pareto frontier —
+the candidates where no other beats them on every objective. The goal is best
+quality PER cost, not perfection at any price.
+
+`finalize()` activates a sensible default (the best-primary candidate on the
+frontier) and lists the cheaper/faster frontier alternatives with the one-liner
+to switch. When you report to the user, present the **frontier**: "here is the
+cheap-good one, the mid one, and the expensive-best one" — and let them pick the
+point on the curve, rather than only handing them the single most-accurate
+candidate.
+
 ## Read results honestly
 
 - **The test column is the report card.** `FinalReport` lists, per finalist,
-  `val_mean`, `test_mean`, and a note. Test was evaluated exactly once; quote
-  the test number, never the val number.
+  `val_mean`, `test_mean`, a note, and its per-objective means with a frontier
+  flag. Test was evaluated exactly once; quote the test number, never the val
+  number.
 - **Overfit demotion.** A finalist whose test score drops far below its val
   score (gap beyond the val CI half-width, min 0.05) is marked
   "overfit to val, demoted". If every finalist is demoted, the report says so
@@ -237,7 +300,8 @@ for workarounds.
 | `data_sha` mismatch when re-optimizing an existing workspace | The data was split once; re-splitting leaks val/test into train | Pass the original data, or point at a new workspace path |
 | `optimize(data="logs")` (`DataDisciplineError`) | Unreviewed logs only echo the current program | `review_logs()` first, then `data="logs:reviewed"`; or `distill()` if the goal is compression |
 | Scoring before metric sign-off (`MetricNotApprovedError`) | The search optimizes whatever the metric says | Run the demonstration + sign-off conversation with the user |
-| Metric edited after approval (`MetricChangedError`) | Old sign-off is void; old scores are archived, not comparable | Re-demonstrate and re-approve |
+| Metric **code** edited after approval (`MetricChangedError`) | The old sign-off is void until re-approved; scores re-compute from cached outputs (only candidates whose own code changed are archived) | Re-demonstrate and re-approve — it is not a scary wipe |
+| Adding a metric or changing which is **primary** / re-weighting | Config, not code — scores are re-scored from cache or untouched | Nothing; no invalidation, no re-runs |
 | Bootstrap cap: 6th candidate on val (`BootstrapModeError`) | Differences on a tiny val set are one row of noise | Pick the best baseline already scored, or get to 30+ examples |
 | Reading val rows, tracing val/test, eval on test, per-row val scores (`DataDisciplineError`) | Reflection is train-only; selection is aggregate-only; test belongs to `finalize()` | Reflect on train; read val as aggregates; finalize at the end |
 | Second `finalize()` (`FinalizedError`) | Test is evaluated exactly once | Read `final_report.json`; start a fresh workspace to keep improving |

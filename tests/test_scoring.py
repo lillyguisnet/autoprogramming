@@ -207,7 +207,8 @@ def test_paired_diff_length_mismatch():
 def test_load_scores_skeleton_without_file(tmp_path):
     workspace = FakeWorkspace(tmp_path / "shout_ap", SHOUT_SCHEMA)
     assert scoring.load_scores(workspace) == {
-        "metric_sha": None, "candidates": {}, "val_scored": [], "flags": {},
+        "metric_sha": None, "objectives": {}, "primary": None,
+        "candidates": {}, "val_scored": [], "flags": {},
     }
 
 
@@ -557,12 +558,333 @@ def test_metric_edit_and_reapproval_keeps_val_registration(ws, monkeypatch):
     )
     metric.approve(ws, "tester")
 
-    with pytest.warns(UserWarning, match="never comparable"):
+    # The candidate's outputs were cached by the first eval, so the metric
+    # change re-scores from cache instead of wiping — no "never comparable"
+    # archive warning fires (only stale/absent caches warn).
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         report = scoring.evaluate(ws, "candidate_0", split="val")
+    assert not any("never comparable" in str(w.message) for w in caught)
     assert report.mean == 1.0
 
     stored = json.loads(ws.scores_json.read_text())
     assert stored["val_scored"] == ["candidate_0"]
     assert stored["metric_sha"] == metric.metric_sha(ws)
     assert "candidate_0" in stored["candidates"]
-    assert (ws.root / "scores.archive" / "0.json").exists()
+    # Recovered from cache, so nothing was archived (archive is the last resort
+    # for candidates whose code changed or was never cached).
+    assert not (ws.root / "scores.archive" / "0.json").exists()
+
+
+# ------------------------------------------------------- multi-objective scoring
+
+
+MULTI_QUALITY = (
+    "def exact(predicted, expected):\n"
+    "    return 1.0 if predicted == expected else 0.0\n"
+    "def half(predicted, expected):\n"
+    "    return 0.5\n"
+    "METRICS = {'exact': exact, 'half': half}\n"
+)
+
+
+def priced_run(cost, latency):
+    """A run_fn that reports a fixed cost and latency (deterministic objectives)."""
+    def _run(inputs):
+        return SimpleNamespace(
+            ok=True, outputs={"Loud": inputs["text"].upper() + "!"},
+            error=None, cost_dollars=cost, duration_s=latency,
+        )
+    return _run
+
+
+def _multi_ws(tmp_path, name="shout_ap", primary="exact"):
+    workspace = FakeWorkspace(tmp_path / name, SHOUT_SCHEMA)
+    metric.write_metric(workspace, MULTI_QUALITY)
+    metric.approve(workspace, "tester", primary=primary)
+    BudgetLedger.start(workspace.budget_json, Budget(eval_calls=1000))
+    return workspace
+
+
+def test_evaluate_scores_all_objectives_and_mirrors_primary(tmp_path, monkeypatch):
+    workspace = _multi_ws(tmp_path)
+    install_fakes(monkeypatch, candidate=make_candidate(), run_fn=priced_run(0.25, 0.1))
+    rep = scoring.evaluate(workspace, "candidate_0", split="val")
+
+    # primary (exact) mirrored to the top level, exactly today's shape
+    assert rep.primary == "exact"
+    assert rep.mean == 1.0
+    # every objective present, including the primary and the two cost objectives
+    assert set(rep.objectives) == {"exact", "half", "cost_dollars", "latency_s"}
+    assert rep.objectives["exact"]["mean"] == 1.0
+    assert rep.objectives["half"]["mean"] == 0.5
+    assert rep.objectives["cost_dollars"]["mean"] == pytest.approx(0.25)
+    assert rep.objectives["latency_s"]["mean"] == pytest.approx(0.1)
+
+    stored = json.loads(workspace.scores_json.read_text())
+    assert stored["primary"] == "exact"
+    assert stored["objectives"] == {
+        "exact": "max", "half": "max", "cost_dollars": "min", "latency_s": "min",
+    }
+    val = stored["candidates"]["candidate_0"]["val"]
+    assert val["mean"] == 1.0  # primary mirror at the top level
+    assert set(val["objectives"]) == {"exact", "half", "cost_dollars", "latency_s"}
+    assert val["objectives"]["cost_dollars"]["mean"] == pytest.approx(0.25)
+
+    text = str(rep)
+    assert "[primary: exact]" in text
+    assert "half:" in text and "(max)" in text
+    assert "cost_dollars:" in text and "(min)" in text
+
+    # the outputs cache is written, carrying per-repeat cost + latency
+    cache = scoring.cache_path(workspace, "candidate_0", "val")
+    assert cache.exists()
+    cached = json.loads(cache.read_text())
+    assert cached["rows"]["row_0"][0]["cost_dollars"] == pytest.approx(0.25)
+    assert cached["rows"]["row_0"][0]["latency_s"] == pytest.approx(0.1)
+
+
+def test_rescore_from_cache_charges_no_budget(tmp_path, monkeypatch):
+    workspace = _multi_ws(tmp_path)
+    install_fakes(monkeypatch, candidate=make_candidate(), run_fn=priced_run(0.25, 0.1))
+    scoring.evaluate(workspace, "candidate_0", split="val")
+
+    spent = BudgetLedger(workspace.budget_json).spent["eval_calls"]
+    assert scoring.rescore(workspace, "candidate_0", "val") is True
+    assert BudgetLedger(workspace.budget_json).spent["eval_calls"] == spent  # no runs
+
+    # a candidate that was never evaluated has no cache -> caller must re-run
+    assert scoring.rescore(workspace, "candidate_9", "val") is False
+
+
+def test_metric_edit_rescore_from_cache_without_archiving(tmp_path, monkeypatch):
+    workspace = _multi_ws(tmp_path)
+    install_fakes(monkeypatch, candidate=make_candidate(), run_fn=priced_run(0.25, 0.1))
+    scoring.evaluate(workspace, "candidate_0", split="val")
+    assert json.loads(workspace.scores_json.read_text())[
+        "candidates"]["candidate_0"]["val"]["mean"] == 1.0
+
+    # Edit the metric in place: now everything scores 0.5. The candidate's code
+    # is unchanged, so its cached outputs re-score for free — no archive/warn.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        metric.write_metric(workspace, "def metric(p, e):\n    return 0.5\n")
+    assert not any("never comparable" in str(w.message) for w in caught)
+    assert not (workspace.root / "scores.archive").exists()
+
+    scores = scoring.load_scores(workspace)
+    val = scores["candidates"]["candidate_0"]["val"]
+    assert val["mean"] == 0.5  # re-scored under the new metric from cache
+    assert val["objectives"]["quality"]["mean"] == 0.5
+    # cost/latency survived untouched (they are metric-independent)
+    assert val["objectives"]["cost_dollars"]["mean"] == pytest.approx(0.25)
+    assert val["objectives"]["latency_s"]["mean"] == pytest.approx(0.1)
+    assert scores["primary"] == "quality"
+
+
+def test_primary_switch_remirrors_top_level_without_reruns(tmp_path, monkeypatch):
+    # Switching the primary metric is config, not code: the top-level mirror
+    # must follow to the new primary's stored numbers, or finalize() would
+    # compare an old-primary val mean against a new-primary test mean and
+    # fabricate an overfit demotion (and it must not re-run or wipe anything).
+    workspace = _multi_ws(tmp_path, primary="exact")
+    install_fakes(monkeypatch, candidate=make_candidate(), run_fn=priced_run(0.25, 0.1))
+    scoring.evaluate(workspace, "candidate_0", split="val")
+    assert json.loads(workspace.scores_json.read_text())[
+        "candidates"]["candidate_0"]["val"]["mean"] == 1.0
+
+    metric.approve(workspace, "tester", primary="half")   # re-approve, new primary
+    spent = BudgetLedger(workspace.budget_json).spent["eval_calls"]
+    scores = scoring.load_scores(workspace)               # reconcile_config runs here
+
+    val = scores["candidates"]["candidate_0"]["val"]
+    assert scores["primary"] == "half"
+    assert val["mean"] == 0.5                             # mirror now follows 'half'
+    assert val["objectives"]["exact"]["mean"] == 1.0      # both objectives retained
+    assert val["objectives"]["half"]["mean"] == 0.5
+    assert BudgetLedger(workspace.budget_json).spent["eval_calls"] == spent
+    assert not (workspace.root / "scores.archive").exists()  # config change never wipes
+
+
+def test_compare_on_cost_objective_respects_min_goal(tmp_path, monkeypatch):
+    # A more-expensive challenger must NOT read as "improved" on a min objective.
+    workspace = _multi_ws(tmp_path)
+    install_fakes(monkeypatch, candidate=make_candidate(name="candidate_0"),
+                  run_fn=priced_run(0.10, 0.1))
+    scoring.evaluate(workspace, "candidate_0", split="val")
+    install_fakes(monkeypatch, candidate=make_candidate(name="candidate_1"),
+                  run_fn=priced_run(0.20, 0.1))
+    scoring.evaluate(workspace, "candidate_1", split="val")
+
+    worse = scoring.compare(workspace, "candidate_0", "candidate_1", objective="cost_dollars")
+    assert worse.goal == "min"
+    assert worse.diff_mean > 0            # candidate_1 - candidate_0 = +0.10 (costlier)
+    assert worse.improved is False        # costlier is not an improvement
+    better = scoring.compare(workspace, "candidate_1", "candidate_0", objective="cost_dollars")
+    assert better.diff_mean < 0
+    assert better.improved is True        # the cheaper challenger wins
+    assert "lower is better" in str(better)
+
+
+def test_per_field_counts_failed_repeats_as_zero(tmp_path, monkeypatch):
+    # Multi-output: a failed run scores 0 in the headline mean; the per-field
+    # breakdown must count it as 0 too, not average over successes only.
+    workspace = FakeWorkspace(tmp_path / "qa_ap", QA_SCHEMA)
+    metric.write_metric(workspace, MULTI_METRIC)
+    metric.approve(workspace, "tester")
+    BudgetLedger.start(workspace.budget_json, Budget(eval_calls=1000))
+
+    splits = {"val": [
+        {"question": "q1", "Answer": "a1", "Confidence": "1.0"},
+        {"question": "q2", "Answer": "a2", "Confidence": "1.0"},
+    ]}
+
+    def run_fn(inputs):
+        if inputs["question"] == "q2":
+            return SimpleNamespace(ok=False, outputs=None, error="boom",
+                                   cost_dollars=None, duration_s=0.0)
+        return SimpleNamespace(ok=True, outputs={"Answer": "a1", "Confidence": 1.0},
+                               error=None, cost_dollars=None, duration_s=0.0)
+
+    install_fakes(monkeypatch, splits=splits, candidate=make_candidate(), run_fn=run_fn)
+    rep = scoring.evaluate(workspace, "candidate_0", split="val")
+    assert rep.mean == pytest.approx(0.5)          # one perfect row, one failed (0)
+    assert rep.per_field["Answer"] == pytest.approx(0.5)
+    assert rep.per_field["Confidence"] == pytest.approx(0.5)
+
+
+# ------------------------------------------------------- pareto_nondominated
+
+
+def test_pareto_nondominated_quality_cost_frontier():
+    points = {
+        "a": {"quality": 0.9, "cost_dollars": 0.20},
+        "b": {"quality": 0.8, "cost_dollars": 0.01},
+        "c": {"quality": 0.7, "cost_dollars": 0.30},  # dominated by both a and b
+    }
+    goals = {"quality": "max", "cost_dollars": "min"}
+    assert scoring.pareto_nondominated(points, goals) == ["a", "b"]  # insertion order
+
+
+def test_pareto_nondominated_cost_tie_broken_by_latency():
+    points = {
+        "slow": {"cost_dollars": 0.1, "latency_s": 0.50},
+        "fast": {"cost_dollars": 0.1, "latency_s": 0.20},  # same cost, faster
+    }
+    goals = {"cost_dollars": "min", "latency_s": "min"}
+    assert scoring.pareto_nondominated(points, goals) == ["fast"]
+
+
+def test_pareto_nondominated_full_tie_keeps_all():
+    points = {"a": {"quality": 0.5}, "b": {"quality": 0.5}}
+    assert scoring.pareto_nondominated(points, {"quality": "max"}) == ["a", "b"]
+
+
+# --------------------------------------------------------------- tradeoffs
+
+
+def _obj(mean):
+    return {"mean": mean, "std": 0.0, "ci95": [mean, mean], "per_field": None}
+
+
+def test_tradeoffs_frontier_over_stored_objectives(tmp_path):
+    workspace = FakeWorkspace(tmp_path / "shout_ap", SHOUT_SCHEMA)
+    metric.write_metric(workspace, EXACT)
+    metric.approve(workspace, "tester")
+    scores = scoring.load_scores(workspace)
+    scores["objectives"] = {"quality": "max", "cost_dollars": "min", "latency_s": "min"}
+    scores["primary"] = "quality"
+    scores["candidates"] = {
+        "candidate_0": {"val": {"objectives": {
+            "quality": _obj(0.9), "cost_dollars": _obj(0.20), "latency_s": _obj(0.1)}}},
+        "candidate_1": {"val": {"objectives": {
+            "quality": _obj(0.8), "cost_dollars": _obj(0.01), "latency_s": _obj(0.1)}}},
+        "candidate_2": {"val": {"objectives": {
+            "quality": _obj(0.5), "cost_dollars": _obj(0.50), "latency_s": _obj(0.3)}}},
+    }
+    scoring.save_scores(workspace, scores)
+
+    rep = scoring.tradeoffs(workspace)
+    assert isinstance(rep, scoring.TradeoffReport)
+    assert set(rep.nondominated) == {"candidate_0", "candidate_1"}
+    # rows sorted by primary (quality) descending
+    assert [r["candidate"] for r in rep.rows] == [
+        "candidate_0", "candidate_1", "candidate_2"]
+    assert rep.rows[0]["dominated"] is False
+    assert rep.rows[-1]["dominated"] is True
+    text = str(rep)
+    assert "quality / cost tradeoffs on val" in text
+    assert "frontier" in text
+
+
+def test_tradeoffs_empty_when_no_objectives(tmp_path):
+    workspace = FakeWorkspace(tmp_path / "shout_ap", SHOUT_SCHEMA)
+    metric.write_metric(workspace, EXACT)
+    metric.approve(workspace, "tester")
+    rep = scoring.tradeoffs(workspace)
+    assert rep.rows == []
+    assert rep.nondominated == []
+    assert "eval some" in str(rep)
+
+
+# ------------------------------------------------------- compare(objective=...)
+
+
+def test_compare_on_named_objective(tmp_path):
+    workspace = FakeWorkspace(tmp_path / "shout_ap", SHOUT_SCHEMA)
+    metric.write_metric(workspace, EXACT)
+    metric.approve(workspace, "tester")
+    scores = scoring.load_scores(workspace)
+
+    def sub(quality_rows, cost_rows):
+        return {
+            "rows": quality_rows,
+            "mean": sum(quality_rows.values()) / len(quality_rows),
+            "std": 0.0, "ci95": [0.0, 1.0], "n_repeats": 1,
+            "repeat_variance": 0.0, "per_field": None,
+            "objectives": {
+                "quality": {"rows": quality_rows},
+                "cost_dollars": {"rows": cost_rows},
+            },
+        }
+
+    scores["candidates"] = {
+        "candidate_0": {"val": sub({"row_0": 1.0, "row_1": 1.0},
+                                   {"row_0": 0.5, "row_1": 0.5})},
+        "candidate_1": {"val": sub({"row_0": 1.0, "row_1": 1.0},
+                                   {"row_0": 0.2, "row_1": 0.2})},
+    }
+    scoring.save_scores(workspace, scores)
+
+    # the default path (objective=None) is the primary metric, unchanged
+    prim = scoring.compare(workspace, "candidate_0", "candidate_1")
+    assert prim.objective is None
+    assert prim.diff_mean == pytest.approx(0.0)
+
+    # comparing on cost_dollars pairs the stored per-row cost scores
+    cost = scoring.compare(workspace, "candidate_0", "candidate_1", objective="cost_dollars")
+    assert cost.objective == "cost_dollars"
+    assert cost.diff_mean == pytest.approx(-0.3)  # b(0.2) - a(0.5) per row
+    assert "[cost_dollars]" in str(cost)
+
+    # the refusal names the objective when a candidate lacks its per-row scores
+    with pytest.raises(DataDisciplineError, match="cost_dollars"):
+        scoring.compare(workspace, "candidate_0", "candidate_9", objective="cost_dollars")
+
+
+# ------------------------------------------------------------- determinism
+
+
+def test_evaluate_objectives_deterministic_across_runs(tmp_path, monkeypatch):
+    def run_once(name):
+        workspace = _multi_ws(tmp_path, name=name)
+        install_fakes(monkeypatch, candidate=make_candidate(), run_fn=priced_run(0.25, 0.1))
+        rep = scoring.evaluate(workspace, "candidate_0", split="val")
+        return rep, scoring.tradeoffs(workspace)
+
+    rep_a, tr_a = run_once("run_a")
+    rep_b, tr_b = run_once("run_b")
+    assert rep_a.objectives == rep_b.objectives
+    assert str(rep_a) == str(rep_b)
+    assert tr_a.nondominated == tr_b.nondominated
+    assert [r["objectives"] for r in tr_a.rows] == [r["objectives"] for r in tr_b.rows]

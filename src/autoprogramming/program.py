@@ -279,6 +279,7 @@ class Program:
             entries=d["entries"],
             activated=d.get("activated"),
             val_reliability=d.get("val_reliability", "ok"),
+            frontier=d.get("frontier", []),
         )
 
     # ----------------------------------------------------------------- save
