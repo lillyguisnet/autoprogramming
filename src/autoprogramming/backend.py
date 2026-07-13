@@ -150,6 +150,7 @@ class NoOpBackend:
                     '    prg.run("candidate_0", split="train", row=0)  # traces: train rows only',
                     '    prg.compare("candidate_0", "candidate_1")   # improved iff CI excludes 0',
                     "    prg.frontier()                              # Pareto frontier over train",
+                    "    prg.tradeoffs()                             # quality/cost frontier on val",
                     "    prg.budget                                  # remaining dollars/calls/minutes",
                     "    prg.finalize()                              # one-time test eval + activate",
                 ]

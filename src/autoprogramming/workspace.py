@@ -17,6 +17,7 @@ import json
 import keyword
 import os
 import re
+import secrets
 import tomllib
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -312,8 +313,34 @@ class Workspace:
 
     @property
     def data_dir(self) -> Path:
-        """``data/`` — the three split CSVs plus split.json."""
+        """``data/`` — public development data plus split metadata."""
         return self.root / "data"
+
+    @property
+    def private_data_dir(self) -> Path | None:
+        """Controller-only val/test storage for resource-confirmed runs.
+
+        It deliberately lives outside the coding-agent workspace. OS-level
+        worker sandboxing remains the strong boundary; this also prevents
+        accidental leakage through ordinary workspace inspection.
+        """
+        try:
+            private_id = self.active.get("private_data_id")
+        except (OSError, ValueError, KeyError):
+            private_id = None
+        if not private_id:
+            return None
+        base = Path(os.environ.get(
+            "AP_PRIVATE_DATA_DIR",
+            Path.home() / ".cache" / "autoprogramming" / "private",
+        ))
+        return base / str(private_id)
+
+    def split_path(self, split: str) -> Path:
+        """Trusted location of a split; val/test may be outside the workspace."""
+        if split in ("val", "test") and self.private_data_dir is not None:
+            return self.private_data_dir / f"{split}.csv"
+        return self.data_dir / f"{split}.csv"
 
     @property
     def candidates_dir(self) -> Path:
@@ -361,6 +388,16 @@ class Workspace:
     def metric_approval(self) -> Path:
         """``metric_approval.json`` — who signed the metric off, and when."""
         return self.root / "metric_approval.json"
+
+    @property
+    def resources_json(self) -> Path:
+        """Confirmed search, runtime, and data-policy capabilities."""
+        return self.root / "resources.json"
+
+    @property
+    def portfolio_json(self) -> Path:
+        """Controller-owned portfolio state (development-time only)."""
+        return self.root / ".ap" / "controller" / "portfolio.json"
 
     @property
     def active_json(self) -> Path:
@@ -432,7 +469,16 @@ class Workspace:
 
     @property
     def schema(self) -> Schema:
-        """The program's Schema, imported from the generated schema.py (cached)."""
+        """The pinned program schema, imported from generated ``schema.py``."""
+        expected_sha = self.active.get("schema_sha")
+        if expected_sha:
+            actual_sha = hashlib.sha256(self.schema_py.read_bytes()).hexdigest()
+            if actual_sha != expected_sha:
+                raise WorkspaceError(
+                    f"schema.py in {self.root} changed after workspace creation. "
+                    "The implementation search satisfies an immutable contract; "
+                    "restore schema.py or start a new workspace for a new schema."
+                )
         if self._schema is None:
             module_name = f"_ap_schema_{self.package_name}"
             spec = importlib.util.spec_from_file_location(module_name, self.schema_py)
@@ -462,6 +508,7 @@ class Workspace:
         ratios,
         data_sha: str,
         bootstrap: bool,
+        secure_data: bool = False,
     ) -> "Workspace":
         """Scaffold a complete workspace: package files, data splits, state files.
 
@@ -501,25 +548,38 @@ class Workspace:
         (ws.artifacts_dir / ".gitkeep").write_text("")
 
         ws.schema_py.write_text(schema.render_module())
+        schema_sha = hashlib.sha256(ws.schema_py.read_bytes()).hexdigest()
         ws.paths_py.write_text(_render_paths(ws.package_name))
         ws.init_py.write_text(_render_init(schema, ws.package_name))
         ws.pyproject.write_text(
             ws._render_pyproject(">=3.11", (), schema.doc)
         )
+        private_data_id = secrets.token_hex(16) if secure_data else None
         ws.save_active({
             "program": schema.name,
             "active": None,
             "test_score": None,
             "activated_at": None,
             "metric_sha": None,
+            "schema_sha": schema_sha,
             "finalized": False,
             "created_at": _utcnow_iso(),
+            "private_data_id": private_data_id,
         })
 
         columns = schema.expected_columns
-        for split in ("train", "val", "test"):
-            _write_csv(ws.data_dir / f"{split}.csv", splits[split], columns)
-        os.chmod(ws.data_dir / "test.csv", TEST_CSV_PERMS)
+        _write_csv(ws.data_dir / "train.csv", splits["train"], columns)
+        if secure_data:
+            private = ws.private_data_dir
+            private.mkdir(parents=True, mode=0o700)
+            os.chmod(private, 0o700)
+            for split in ("val", "test"):
+                _write_csv(private / f"{split}.csv", splits[split], columns)
+                os.chmod(private / f"{split}.csv", 0o600)
+        else:
+            for split in ("val", "test"):
+                _write_csv(ws.data_dir / f"{split}.csv", splits[split], columns)
+            os.chmod(ws.data_dir / "test.csv", TEST_CSV_PERMS)
 
         ws.split_json.write_text(json.dumps({
             "seed": seed,
@@ -571,7 +631,43 @@ class Workspace:
                 f"corrupt. schema.py is the immutable program definition — "
                 f"restore it from version control or recreate the workspace."
             )
+        if ws.private_data_dir is not None:
+            missing_private = [
+                split for split in ("val", "test")
+                if not (ws.private_data_dir / f"{split}.csv").exists()
+            ]
+            if missing_private:
+                raise WorkspaceError(
+                    f"{path} references controller-private data but is missing "
+                    f"{missing_private}. Restore the private run data under "
+                    "$AP_PRIVATE_DATA_DIR (or ~/.cache/autoprogramming/private); "
+                    "re-splitting would invalidate the run."
+                )
         return ws
+
+    def secure_splits(self) -> None:
+        """Move legacy val/test CSVs out of the coding-agent workspace."""
+        if self.private_data_dir is not None:
+            return
+        sources = {split: self.data_dir / f"{split}.csv" for split in ("val", "test")}
+        missing = [str(path) for path in sources.values() if not path.exists()]
+        if missing:
+            raise WorkspaceError(
+                f"Cannot secure fixed splits because files are missing: {missing}. "
+                "Restore them rather than regenerating the split."
+            )
+        info = self.active
+        info["private_data_id"] = secrets.token_hex(16)
+        self.save_active(info)
+        private = self.private_data_dir
+        private.mkdir(parents=True, mode=0o700)
+        os.chmod(private, 0o700)
+        for split in ("val", "test"):
+            source = sources[split]
+            target = private / f"{split}.csv"
+            target.write_bytes(source.read_bytes())
+            os.chmod(target, 0o600)
+            source.unlink()
 
     # ------------------------------------------------------------ activation
 
@@ -636,7 +732,7 @@ class Workspace:
             f'package-dir = {{{json.dumps(pkg)} = "."}}\n'
             "\n"
             "[tool.setuptools.package-data]\n"
-            f'{json.dumps(pkg)} = ["active.json", "candidates/*.py", "artifacts/*"]\n'
+            f'{json.dumps(pkg)} = ["active.json", "candidates/*.py", "artifacts/*", "artifacts/**/*"]\n'
         )
 
     def _metric_sha(self) -> str | None:

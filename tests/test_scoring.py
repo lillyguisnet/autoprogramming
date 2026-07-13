@@ -579,6 +579,31 @@ def test_metric_edit_and_reapproval_keeps_val_registration(ws, monkeypatch):
 # ------------------------------------------------------- multi-objective scoring
 
 
+def test_aggregate_reports_cold_start_separately_from_warm_latency():
+    cache = {
+        "row_0": [{
+            "ok": True, "outputs": {"Loud": "A!"}, "cost_dollars": 0.0,
+            "latency_s": 1.5, "cold_start": True,
+        }],
+        "row_1": [{
+            "ok": True, "outputs": {"Loud": "B!"}, "cost_dollars": 0.0,
+            "latency_s": 0.1, "cold_start": False,
+        }],
+    }
+    expected = {"row_0": {"Loud": "A!"}, "row_1": {"Loud": "B!"}}
+    sub = scoring._aggregate_from_cache(
+        cache,
+        {"quality": lambda p, e: float(p == e)},
+        "quality",
+        SHOUT_SCHEMA,
+        None,
+        expected,
+        1,
+    )
+    assert sub["cold_start_s"] == pytest.approx(1.5)
+    assert sub["objectives"]["latency_s"]["mean"] == pytest.approx(0.1)
+
+
 MULTI_QUALITY = (
     "def exact(predicted, expected):\n"
     "    return 1.0 if predicted == expected else 0.0\n"
@@ -642,6 +667,16 @@ def test_evaluate_scores_all_objectives_and_mirrors_primary(tmp_path, monkeypatc
     cached = json.loads(cache.read_text())
     assert cached["rows"]["row_0"][0]["cost_dollars"] == pytest.approx(0.25)
     assert cached["rows"]["row_0"][0]["latency_s"] == pytest.approx(0.1)
+
+
+def test_unknown_cost_is_conservative_and_strict_json_safe(tmp_path, monkeypatch):
+    workspace = _multi_ws(tmp_path)
+    install_fakes(monkeypatch, candidate=make_candidate(), run_fn=priced_run(None, 0.1))
+    rep = scoring.evaluate(workspace, "candidate_0", split="val")
+    assert rep.objectives["cost_dollars"]["mean"] == scoring.UNKNOWN_COST
+    assert "unknown" in str(rep)
+    # scores.json is consumable by strict JSON implementations (no Infinity/NaN).
+    json.dumps(json.loads(workspace.scores_json.read_text()), allow_nan=False)
 
 
 def test_rescore_from_cache_charges_no_budget(tmp_path, monkeypatch):

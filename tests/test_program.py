@@ -436,6 +436,41 @@ def test_budget_exceeded_in_backend_still_finalizes(tmp_path, monkeypatch):
     assert report.activated == "candidate_0"
 
 
+def test_budget_exhaustion_does_not_finalize_incomplete_pi_portfolio(
+    tmp_path, monkeypatch
+):
+    require_siblings()
+    monkeypatch.setenv("AP_AUTO_APPROVE_METRIC", "1")
+
+    def drive_with_pending_journal(harness, context):
+        from autoprogramming.portfolio import Portfolio
+
+        drive_full(harness, context)
+        resources = ap.Resources(
+            search=ap.SearchResources(
+                allow_package_installs=False, allow_model_downloads=False
+            ),
+            runtime=ap.RuntimeResources(network=False),
+            data=ap.DataPolicy(external_egress=False),
+            confirmed=True,
+        )
+        portfolio = Portfolio.create(resources, [])
+        portfolio.avenues[0].begin_candidate("candidate_999")
+        harness.workspace.portfolio_json.parent.mkdir(parents=True, exist_ok=True)
+        portfolio.write(harness.workspace.portfolio_json)
+        raise BudgetExceededError("simulated exhausted Pi portfolio")
+
+    prg = make_shout()
+    report = prg.optimize(
+        rows_for(30),
+        budget=Budget(eval_calls=1000),
+        workspace=tmp_path / "pending_ap",
+        backend=ScriptedBackend(drive_with_pending_journal),
+    )
+    assert report is None
+    assert prg.workspace.active["finalized"] is False
+
+
 def test_optimize_logs_reviewed_flow(tmp_path, monkeypatch, capsys):
     require_siblings()
     ws_root = tmp_path / "shout_ap"

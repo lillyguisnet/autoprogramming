@@ -65,6 +65,27 @@ def write_candidate(ws, source, name="candidate_0"):
 # ------------------------------------------------------------ success paths
 
 
+def test_candidate_session_reuses_module_state_and_marks_cold_start(tmp_path):
+    ws = make_ws(tmp_path)
+    cand = write_candidate(
+        ws,
+        "_calls = 0\n"
+        "def predict(text):\n"
+        "    global _calls\n"
+        "    _calls += 1\n"
+        "    return str(_calls)\n",
+    )
+    with runner.CandidateSession(ws, cand) as session:
+        first = session.run({"text": "a"})
+        second = session.run({"text": "b"})
+    assert first.ok and second.ok
+    assert first.outputs == {"Loud": "1"}
+    assert second.outputs == {"Loud": "2"}
+    assert first.cold_start is True
+    assert second.cold_start is False
+    assert not list(ws.tmp_dir.glob("session_*"))
+
+
 def test_success_single_output(tmp_path):
     ws = make_ws(tmp_path)
     cand = write_candidate(ws, UPPER)

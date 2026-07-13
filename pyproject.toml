@@ -1,8 +1,9 @@
 [project]
 name = "autoprogramming"
-version = "0.1.0"
+version = "0.2.0"
 description = "Define your inputs and outputs, and let a coding agent find the best implementation."
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = []
 

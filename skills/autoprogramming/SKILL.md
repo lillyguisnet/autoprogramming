@@ -27,7 +27,7 @@ uv add "git+https://github.com/lillyguisnet/autoprogramming.git"
   dependencies run under `uv run --no-project` in their own ephemeral
   environments (conflicting deps coexist). Stdlib-only candidates run without uv.
 
-## The conversation: five questions
+## The conversation: six questions
 
 Ask these, in order, before writing any code. Everything else the library and
 the optimizer figure out.
@@ -46,31 +46,36 @@ the optimizer figure out.
    confidently-scored wrong program. Never skip; never approve on the user's
    behalf. You may propose **several quality metrics at once** (a strict one and
    a graded one, say); every candidate is scored on all of them from a single
-   run, so extra metrics cost ~nothing. Designate a **primary** — the headline
-   number that drives ranking and activation. Demonstrate the set on real
-   examples and iterate until the scores match the user's intuition:
+   run, so extra metrics cost ~nothing. Classify lenses as **acceptance**
+   (user-approved and eligible to select the final program) or **diagnostic**
+   (search guidance only). Precommit acceptance floors and preference order;
+   do not average everything into one gameable scalar. Demonstrate every lens
+   on real examples and iterate until the scores match the user's intuition:
 
    ```
-   I propose two lenses: chrF (graded, primary) and exact-match (strict).
+   I propose chrF as an acceptance lens and exact-match as a strict diagnostic.
      expected:  "Où est la gare ?"
      predicted: "Où se trouve la gare ?"
-         chrF: 0.81  <- primary   exact: 0.00
+         chrF: 0.81  <- acceptance   exact: 0.00  <- diagnostic
      predicted: "Où est la gare ?"
-         chrF: 1.00  <- primary   exact: 1.00
+         chrF: 1.00                  exact: 1.00
      predicted: "La gare est fermée."
-         chrF: 0.34  <- primary   exact: 0.00
+         chrF: 0.34                  exact: 0.00
    Does chrF 0.81 for the synonymous phrasing match your intuition of "good"?
-   If synonyms should score ~1.0, I'll swap chrF for embedding similarity.
    ```
 
    For multi-output programs the per-field aggregate weighting is also part of
-   the sign-off. Which metric is primary, and any weights, are **config, not
-   code**: re-ranking or re-weighting later never wipes scores.
-5. **Any constraints?** Data allowed to leave the machine? Max cost per call?
-   Offline only? Which packages may be installed? These narrow the candidate
-   search space. Cost and latency are measured automatically as objectives (see
-   below), so "under $0.001/call" or "under 100ms" become real selection
-   pressure, not just wishes.
+   sign-off. Acceptance roles, floors, and preference order are frozen before
+   val selection; diagnostic lenses may evolve and re-score cached outputs.
+5. **What resources exist while SEARCHING?** CPU/RAM/disk, GPU + VRAM,
+   package/model-download permission, fine-tuning services, permitted Pi models,
+   maximum parallel workers, and a conservative maximum dollars per agent call
+   if parallel Pi spend should be reserved rather than serialized.
+6. **What may the SHIPPED PROGRAM require?** Runtime CPU/GPU/RAM/network,
+   candidate API providers, latency/cost/artifact limits, and whether task data
+   may leave the machine. Search and runtime resources are different contracts.
+   Never persist credentials; construct and confirm `ap.Resources` from capability
+   names and constraints. Cost and latency become real objectives.
 
 ## Define the program
 
@@ -121,11 +126,32 @@ ap.Budget(dollars=20)                    # or eval_calls=2000, or minutes=30
 ap.Budget(dollars=20, minutes=60)        # combinable; first limit hit stops the run
 ```
 
-## Run optimize()
+## Prepare, approve, then run the Pi portfolio
 
 ```py
-report = translate.optimize(data=pairs, budget=ap.Budget(dollars=20))
+resources = ap.Resources(
+    search=ap.SearchResources(max_parallel_agents=4,
+                              max_dollars_per_agent_call=0.05,
+                              pi_local=True,  # egress is false below
+                              allow_package_installs=True,
+                              allow_model_downloads=True),
+    runtime=ap.RuntimeResources(network=False),
+    data=ap.DataPolicy(external_egress=False),
+    confirmed=True,
+)
+prepared = translate.prepare(pairs, resources=resources,
+                             budget=ap.Budget(dollars=2))
+prepared.show_metric_suite()
+prepared.demonstrate_metrics(user_chosen_examples)
+prepared.approve_metrics("user")
+report = prepared.optimize(ap.Budget(dollars=20))
 ```
+
+The main Pi agent orchestrates only. A deterministic Python controller enforces
+breadth and dispatches parallel, implementation-only Pi workers. Those workers
+must never receive optimizer identity, metric names/code/weights, leaderboard
+scores, other workers, val, or test. They see a generic function task, dev-fit
+examples, one assigned mechanism, permitted resources, and their own prior files.
 
 What happens mechanically:
 
@@ -137,15 +163,17 @@ What happens mechanically:
 - A workspace directory is created — default `<program name>_ap/` (e.g.
   `translate_ap/`) — which is itself a valid, installable Python package:
   `pyproject.toml`, `__init__.py` (runs the active candidate), `schema.py`
-  (immutable), `active.json`, `data/` (the three split CSVs; `test.csv` is
-  chmod 400 and harness-controlled), `candidates/` (one PEP 723 `.py` file
+  (SHA-pinned), `active.json`, `data/` (dev train data; resource-confirmed
+  runs keep val/test in controller-private storage outside the agent workspace),
+  `candidates/` (one PEP 723 `.py` file
   each), `artifacts/` (weights, pickles), and `scores.json`. `metric.py` is
   NOT among the created files — it appears only after the metric is proposed
   and approved (the sign-off step below); until then any scoring attempt
   raises `MetricNotApprovedError`.
-- A backend then launches an optimizer coding agent against the workspace
-  (the `claude` CLI when it is on PATH). **When no agent backend is
-  available**, `optimize()` prints that the workspace is ready for a manual
+- With a confirmed `Resources` profile and Pi installed, the default is a Pi
+  strategy orchestrator plus parallel implementation-only Pi workers. Legacy
+  calls without resources retain the Claude/manual backend. **When no agent
+  backend is available**, `optimize()` prints that the workspace is ready for a manual
   session with the `ap.attach` snippet — the workspace plus this skill is
   everything needed to drive the loop yourself. Read
   [references/prg-api.md](references/prg-api.md) for the complete agent-side
@@ -153,10 +181,12 @@ What happens mechanically:
 - The metric set must be proposed, demonstrated on real examples, and approved
   before any scoring happens. Editing a metric's **code** later re-scores every
   candidate from its cached outputs (free — no re-runs) and archives only
-  candidates whose own code changed and can't be recovered. Changing which
-  metric is **primary**, or re-weighting, touches nothing — it is config.
-- The optimizer loop is: survey the approach ladder and seed a **diverse
-  portfolio** across cost tiers, baseline it on **val** and read the
+  candidates whose own code/artifact bundle changed and can't be recovered.
+  Diagnostic roles may evolve, but acceptance roles/floors/preference are
+  precommitted before val and cannot be changed afterward.
+- The controller loop is: require one avenue in every resource-feasible tier,
+  dispatch those avenues to parallel Pi workers, baseline the portfolio on
+  **val** and read the
   quality/cost frontier (`prg.tradeoffs()`), deepen and compose the promising
   tiers by reflecting on **train** failures (full traces allowed) and selecting
   on **val** (aggregate scores only), all within budget. **test** is
@@ -207,14 +237,15 @@ remember (SAM 1 when a newer, smaller, faster SAM exists) instead of today's.
 
 ## Cost is an objective — present the frontier, not one number
 
-`cost_dollars` and `latency_s` are measured on every candidate automatically
-(lower is better), independent of the metric. Every eval reports them next to the
+`latency_s` is measured on every run. `cost_dollars` is taken from the
+candidate's `AP_COST_DOLLARS` report or declared `cost_per_call`; missing cost is
+**unknown**, never silently `$0` (lower is better). Every eval reports them next to the
 quality metrics, and `prg.tradeoffs()` shows the quality/cost Pareto frontier —
 the candidates where no other beats them on every objective. The goal is best
 quality PER cost, not perfection at any price.
 
-`finalize()` activates a sensible default (the best-primary candidate on the
-frontier) and lists the cheaper/faster frontier alternatives with the one-liner
+`finalize()` activates the frontier point selected by the precommitted
+acceptance preference and lists quality/cost frontier alternatives with the one-liner
 to switch. When you report to the user, present the **frontier**: "here is the
 cheap-good one, the mid one, and the expensive-best one" — and let them pick the
 point on the curve, rather than only handing them the single most-accurate
@@ -301,7 +332,8 @@ for workarounds.
 | `optimize(data="logs")` (`DataDisciplineError`) | Unreviewed logs only echo the current program | `review_logs()` first, then `data="logs:reviewed"`; or `distill()` if the goal is compression |
 | Scoring before metric sign-off (`MetricNotApprovedError`) | The search optimizes whatever the metric says | Run the demonstration + sign-off conversation with the user |
 | Metric **code** edited after approval (`MetricChangedError`) | The old sign-off is void until re-approved; scores re-compute from cached outputs (only candidates whose own code changed are archived) | Re-demonstrate and re-approve — it is not a scary wipe |
-| Adding a metric or changing which is **primary** / re-weighting | Config, not code — scores are re-scored from cache or untouched | Nothing; no invalidation, no re-runs |
+| Adding a diagnostic metric | Re-scores cached outputs without candidate calls | Re-demonstrate/re-approve code; acceptance policy stays fixed |
+| Changing acceptance roles/floors/preference after val began | Would choose policy after seeing selection results | Start a fresh workspace; the policy is precommitted |
 | Bootstrap cap: 6th candidate on val (`BootstrapModeError`) | Differences on a tiny val set are one row of noise | Pick the best baseline already scored, or get to 30+ examples |
 | Reading val rows, tracing val/test, eval on test, per-row val scores (`DataDisciplineError`) | Reflection is train-only; selection is aggregate-only; test belongs to `finalize()` | Reflect on train; read val as aggregates; finalize at the end |
 | Second `finalize()` (`FinalizedError`) | Test is evaluated exactly once | Read `final_report.json`; start a fresh workspace to keep improving |

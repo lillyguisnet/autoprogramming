@@ -14,6 +14,7 @@ vector lives alongside under ``["objectives"]``.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib
 import json
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     from .workspace import Workspace
 
 DEFAULT_REPEATS = 3
+UNKNOWN_COST = float.fromhex("0x1.fffffffffffffp+1023")
 
 #: Cost objectives are properties of the run (lower is better), captured for
 #: free on every candidate and independent of metric.py.
@@ -69,6 +71,7 @@ class EvalReport:
     flags: list[str]
     objectives: dict[str, dict] = field(default_factory=dict)
     primary: str | None = None
+    cold_start_s: float | None = None
 
     def __str__(self) -> str:
         headline = (
@@ -80,15 +83,23 @@ class EvalReport:
             headline += f"  [primary: {self.primary}]"
         lines = [headline]
         lines.extend(self.flags)
+        if self.cold_start_s is not None:
+            lines.append(f"  cold_start_s: {self.cold_start_s:.3f}s  (reported separately)")
         for name, obj in self.objectives.items():
             if name == self.primary:
                 continue
             goal = "min" if name in COST_OBJECTIVES else "max"
             ci = obj.get("ci95") or [obj["mean"], obj["mean"]]
-            lines.append(
-                f"  {name}: {_format_objective(name, obj['mean'])}  ({goal})  "
-                f"95% CI [{float(ci[0]):.4g}, {float(ci[1]):.4g}]"
-            )
+            if name == "cost_dollars" and float(obj["mean"]) >= UNKNOWN_COST:
+                lines.append(
+                    "  cost_dollars: unknown  (min; declare cost_per_call or "
+                    "AP_COST_DOLLARS)"
+                )
+            else:
+                lines.append(
+                    f"  {name}: {_format_objective(name, obj['mean'])}  ({goal})  "
+                    f"95% CI [{float(ci[0]):.4g}, {float(ci[1]):.4g}]"
+                )
         return "\n".join(lines)
 
 
@@ -162,7 +173,7 @@ class TradeoffReport:
 
 def _format_objective(name: str, value: float) -> str:
     if name == "cost_dollars":
-        return f"${value:.4g}"
+        return "unknown" if value >= UNKNOWN_COST else f"${value:.4g}"
     if name == "latency_s":
         return f"{value:.3f}s"
     return f"{value:.3f}"
@@ -249,7 +260,9 @@ _COST_PARETO_SIGFIGS = 3
 
 
 def _round_sig(x: float, sig: int = _COST_PARETO_SIGFIGS) -> float:
-    if not math.isfinite(x) or x == 0:
+    if not math.isfinite(x) or x >= UNKNOWN_COST:
+        return x  # unknown cost stays worst; it must never round into "free"
+    if x == 0:
         return 0.0
     digits = -int(math.floor(math.log10(abs(x)))) + (sig - 1)
     return round(x, digits)
@@ -313,7 +326,12 @@ def cache_path(workspace, candidate_name: str, split: str) -> Path:
     return Path(base) / f"{candidate_name}__{split}.json"
 
 
-def _source_sha(candidate) -> str:
+def _source_sha(workspace, candidate) -> str:
+    """Pinned candidate bundle identity (source plus declared artifacts)."""
+    candidates_mod = _sibling("candidates")
+    bundle = getattr(candidates_mod, "bundle_sha", None)
+    if bundle is not None:
+        return bundle(workspace, candidate)
     return hashlib.sha256(candidate.source.encode("utf-8")).hexdigest()
 
 
@@ -336,7 +354,7 @@ def read_output_cache(workspace, candidate_name: str, split: str) -> dict | None
         candidate = _sibling("candidates").load_candidate(workspace, candidate_name)
     except Exception:
         return None
-    if data.get("source_sha") != _source_sha(candidate):
+    if data.get("source_sha") != _source_sha(workspace, candidate):
         return None
     return data
 
@@ -345,7 +363,7 @@ def write_output_cache(workspace, candidate, split: str, cache_rows: dict) -> No
     """Persist a candidate/split's per-repeat outputs + cost + latency."""
     path = cache_path(workspace, candidate.name, split)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"source_sha": _source_sha(candidate), "rows": cache_rows}
+    payload = {"source_sha": _source_sha(workspace, candidate), "rows": cache_rows}
     path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
@@ -355,8 +373,13 @@ def _run_cache_entry(run) -> dict:
     return {
         "ok": ok,
         "outputs": getattr(run, "outputs", None) if ok else None,
-        "cost_dollars": float(getattr(run, "cost_dollars", None) or 0.0),
+        "cost_dollars": (
+            None
+            if getattr(run, "cost_dollars", None) is None
+            else float(getattr(run, "cost_dollars"))
+        ),
         "latency_s": float(getattr(run, "duration_s", 0.0) or 0.0),
+        "cold_start": bool(getattr(run, "cold_start", False)),
     }
 
 
@@ -373,9 +396,16 @@ def _aggregate_stats(row_means: dict, per_field_lists=None) -> dict:
     """Mean/std/ci95 over per-row means (rows ordered by index for determinism)."""
     ordered = sorted(row_means, key=_row_index)
     means = [row_means[rid] for rid in ordered]
-    mean = fmean(means) if means else 0.0
-    std = pstdev(means) if means else 0.0
-    lo, hi = bootstrap_ci(means)
+    if means and any((not math.isfinite(v)) or v >= UNKNOWN_COST for v in means):
+        # A finite JSON-safe sentinel keeps strict parsers happy while remaining
+        # conservative for a minimized Pareto objective.
+        mean = UNKNOWN_COST
+        std = 0.0
+        lo, hi = (UNKNOWN_COST, UNKNOWN_COST)
+    else:
+        mean = fmean(means) if means else 0.0
+        std = pstdev(means) if means else 0.0
+        lo, hi = bootstrap_ci(means)
     per_field = (
         {name: fmean(vals) for name, vals in per_field_lists.items()}
         if per_field_lists
@@ -404,6 +434,8 @@ def _aggregate_from_cache(
     q_field_lists = {name: {} for name in metrics}
     cost_row_means: dict = {}
     latency_row_means: dict = {}
+    cold_start_durations: list[float] = []
+    cold_only_latency_rows: set[str] = set()
     primary_row_variances: list[float] = []
 
     for rid in ordered:
@@ -434,12 +466,36 @@ def _aggregate_from_cache(
                 primary_row_variances.append(
                     pvariance(repeat_scores) if repeat_scores else 0.0
                 )
+        reported_costs = [r.get("cost_dollars") for r in reps]
         cost_row_means[rid] = (
-            fmean([float(r.get("cost_dollars") or 0.0) for r in reps]) if reps else 0.0
+            UNKNOWN_COST
+            if any(value is None for value in reported_costs)
+            else fmean([float(value) for value in reported_costs])
+            if reported_costs
+            else UNKNOWN_COST
         )
-        latency_row_means[rid] = (
-            fmean([float(r.get("latency_s") or 0.0) for r in reps]) if reps else 0.0
-        )
+        cold = [
+            float(r.get("latency_s") or 0.0)
+            for r in reps if r.get("cold_start")
+        ]
+        cold_start_durations.extend(cold)
+        warm = [
+            float(r.get("latency_s") or 0.0)
+            for r in reps if not r.get("cold_start")
+        ]
+        # A one-call evaluation has no warm sample; retain its end-to-end
+        # duration rather than fabricating zero.
+        latency_row_means[rid] = fmean(warm or [
+            float(r.get("latency_s") or 0.0) for r in reps
+        ]) if reps else 0.0
+        if cold and not warm:
+            cold_only_latency_rows.add(rid)
+
+    # Once a warm sample exists, remove the one cold-only row from the warm
+    # latency objective. Cold start remains separately reported.
+    if set(latency_row_means) - cold_only_latency_rows:
+        for rid in cold_only_latency_rows:
+            latency_row_means.pop(rid, None)
 
     objectives: dict[str, dict] = {}
     for name in metrics:
@@ -456,6 +512,9 @@ def _aggregate_from_cache(
         "n_repeats": n_repeats,
         "repeat_variance": fmean(primary_row_variances) if primary_row_variances else 0.0,
         "per_field": prim["per_field"],
+        "cold_start_s": (
+            fmean(cold_start_durations) if cold_start_durations else None
+        ),
         "objectives": objectives,
     }
 
@@ -578,6 +637,7 @@ def reconcile_config(workspace, scores: dict) -> dict:
                     cached["rows"], metrics, current_primary, schema, weights,
                     expected_by_row, _reps_in_cache(cached["rows"]),
                 )
+                entry[split]["candidate_sha"] = cached["source_sha"]
                 changed = True
             else:
                 objs = sub.get("objectives") or {}
@@ -665,6 +725,7 @@ def rescore(workspace, candidate_name: str, split: str) -> bool:
         cached["rows"], metrics, primary, schema, weights,
         expected_by_row, _reps_in_cache(cached["rows"]),
     )
+    sub["candidate_sha"] = cached["source_sha"]
     scores = load_scores(workspace)
     scores["candidates"].setdefault(candidate_name, {})[split] = sub
     scores["objectives"] = _objective_directions(metrics)
@@ -732,6 +793,7 @@ def reconcile_metric_change(workspace, new_sha: str | None) -> None:
                 cached["rows"], metrics, primary, schema, weights,
                 expected_by_row, _reps_in_cache(cached["rows"]),
             )
+            sub["candidate_sha"] = cached["source_sha"]
             fresh["candidates"].setdefault(cand_name, {})[split] = sub
         fresh["objectives"] = _objective_directions(metrics)
         fresh["primary"] = primary
@@ -832,24 +894,41 @@ def evaluate(
     expected_by_row: dict[str, dict] = {}
     run_errors: list[str] = []
 
-    for i, row in enumerate(rows):
-        row_id = f"row_{i}"
-        ledger.check()
-        inputs = schema.coerce_inputs(row)
-        expected_by_row[row_id] = schema.coerce_expected(row)
-        reps_list: list[dict] = []
-        for rep in range(1, reps + 1):
-            run = runner_mod.run_candidate(workspace, candidate, inputs)
-            ledger.charge(eval_calls=1, dollars=getattr(run, "cost_dollars", None) or 0.0)
-            reps_list.append(_run_cache_entry(run))
-            if not run.ok:
-                first = (getattr(run, "error", None) or "candidate failed").strip().splitlines()[0]
-                run_errors.append(f"{row_id} repeat {rep}: {first}")
-        cache_rows[row_id] = reps_list
+    session_cls = getattr(runner_mod, "CandidateSession", None)
+    session_context = (
+        session_cls(workspace, candidate)
+        if session_cls is not None
+        else contextlib.nullcontext(None)
+    )
+    with session_context as candidate_session:
+        run_one = (
+            candidate_session.run
+            if candidate_session is not None
+            else lambda inputs: runner_mod.run_candidate(workspace, candidate, inputs)
+        )
+        for i, row in enumerate(rows):
+            row_id = f"row_{i}"
+            ledger.check()
+            inputs = schema.coerce_inputs(row)
+            expected_by_row[row_id] = schema.coerce_expected(row)
+            reps_list: list[dict] = []
+            for rep in range(1, reps + 1):
+                run = run_one(inputs)
+                ledger.charge(
+                    eval_calls=1,
+                    dollars=getattr(run, "cost_dollars", None) or 0.0,
+                    category="candidate",
+                )
+                reps_list.append(_run_cache_entry(run))
+                if not run.ok:
+                    first = (getattr(run, "error", None) or "candidate failed").strip().splitlines()[0]
+                    run_errors.append(f"{row_id} repeat {rep}: {first}")
+            cache_rows[row_id] = reps_list
 
     sub = _aggregate_from_cache(
         cache_rows, metrics, primary, schema, weights, expected_by_row, reps
     )
+    sub["candidate_sha"] = _source_sha(workspace, candidate)
 
     scores = load_scores(workspace)
     entry = scores["candidates"].setdefault(candidate.name, {})
@@ -894,6 +973,7 @@ def evaluate(
         flags=flags,
         objectives=_objectives_report(sub),
         primary=primary,
+        cold_start_s=sub.get("cold_start_s"),
     )
 
 
@@ -909,6 +989,38 @@ def _cand_key(name: str):
     if prefix and idx.isdigit():
         return (0, int(idx), name)
     return (1, 0, name)
+
+
+# ---------------------------------------------------------- score provenance
+
+
+def score_provenance_current(workspace, candidate_name: str, split: str) -> bool:
+    """Whether a stored split score belongs to the candidate currently on disk.
+
+    Scores written before provenance tracking have no ``candidate_sha`` and are
+    accepted for backwards compatibility. Every new evaluation is pinned.
+    """
+    scores = load_scores(workspace)
+    sub = scores.get("candidates", {}).get(candidate_name, {}).get(split)
+    if not isinstance(sub, dict):
+        return False
+    pinned = sub.get("candidate_sha")
+    if not pinned:
+        return True
+    try:
+        candidate = _sibling("candidates").load_candidate(workspace, candidate_name)
+    except Exception:
+        return False
+    return pinned == _source_sha(workspace, candidate)
+
+
+def assert_score_provenance(workspace, candidate_name: str, split: str) -> None:
+    if not score_provenance_current(workspace, candidate_name, split):
+        raise DataDisciplineError(
+            f"Stored {split} scores for {candidate_name!r} are stale: the candidate "
+            "file changed after evaluation. Selection numbers are pinned to exact "
+            "source code, so re-run prg.eval() before comparing or finalizing it."
+        )
 
 
 # -------------------------------------------------------------------- compare
@@ -927,6 +1039,9 @@ def compare(
     """
     scores = load_scores(workspace)
     stored = scores.get("candidates", {})
+    for candidate_name in (a, b):
+        if isinstance(stored.get(candidate_name, {}).get(split), dict):
+            assert_score_provenance(workspace, candidate_name, split)
     row_maps: dict[str, dict] = {}
     label = "primary" if objective is None else f"{objective!r} objective"
     for name in (a, b):
@@ -953,6 +1068,16 @@ def compare(
         )
     a_vals = [float(row_maps[a][r]) for r in common]
     b_vals = [float(row_maps[b][r]) for r in common]
+    if any(
+        (not math.isfinite(v)) or (objective == "cost_dollars" and v >= UNKNOWN_COST)
+        for v in (*a_vals, *b_vals)
+    ):
+        raise DataDisciplineError(
+            f"Cannot compare {a!r} vs {b!r} on {objective!r}: at least one "
+            "candidate did not report this objective. Unknown monetary cost is "
+            "not treated as free; declare [tool.ap] cost_per_call or set "
+            "AP_COST_DOLLARS after predict()."
+        )
     diff_mean = fmean(bv - av for av, bv in zip(a_vals, b_vals))
     ci95 = paired_bootstrap_diff(a_vals, b_vals)
     # "Improved" is direction-aware: the challenger wins when the CI of b - a
@@ -998,6 +1123,8 @@ def tradeoffs(workspace, split: str = "val", names=None) -> TradeoffReport:
     goals = dict(scores.get("objectives") or {})
     points: dict[str, dict] = {}
     for name, entry in cands.items():
+        if not score_provenance_current(workspace, name, split):
+            continue
         sub = entry.get(split)
         if not isinstance(sub, dict):
             continue

@@ -1,7 +1,11 @@
 # AutoProgramming
 
-> **⭐ Aspirational — this README is the golden objective.**
-> Nothing described here exists yet. This document is written as if the tool were finished, and it defines what we are building in this repo. When the real behavior and this document disagree, this document wins until we deliberately amend it.
+> **Experimental, implemented library (v0.2).**
+> The core API, guarded evaluation harness, package workspace, multi-objective
+> scoring, and Pi portfolio backend are implemented and tested. The remaining
+> security limitation is explicit: cooperative path isolation is not an
+> adversarial OS sandbox; `strict_isolation=True` currently refuses rather than
+> silently weakening that guarantee.
 
 Define your inputs and outputs, and let AutoProgramming find the best implementation.
 
@@ -48,7 +52,46 @@ translate("Hello, how are you?")
 
 `.optimize()` launches a coding agent that iterates on complete implementations — instructions, model choice, SDK, parsing, even the algorithmic approach — using reflective evolution (inspired by [GEPA](https://github.com/gepa-ai/gepa)), under a strict data-splitting discipline described below.
 
-**Budget is explicit and has units.** `ap.Budget(dollars=20)`, `ap.Budget(eval_calls=2000)`, or `ap.Budget(minutes=30)` — combinable; optimization stops when the first limit is hit. Evaluation cost counts against the budget (LLM candidates cost money to *score*, not just to mutate). There is no default; you must say what you're willing to spend.
+**Budget is explicit and has units.** `ap.Budget(dollars=20)`, `ap.Budget(eval_calls=2000)`, or `ap.Budget(minutes=30)` — combinable; optimization stops when the first limit is hit. Evaluation cost and Pi orchestrator/worker cost count against the dollar budget. There is no default; you must say what you're willing to spend.
+
+## Orchestrated portfolio search with Pi
+
+The main Pi agent is a strategy orchestrator, not a candidate author. It plans a resource-feasible portfolio across runtime agents, model graphs, single calls, fine-tunes, specialized models, classical ML, and direct code/rules. A trusted Python controller then launches isolated Pi implementation workers in parallel, one avenue each. Workers receive a generic function contract, development examples, their assigned mechanism, and their own files—never optimizer context, metric code or weights, scores, other workers, val, or test.
+
+Search is breadth-first by policy, not merely by prompt: every feasible family must be attempted or explicitly excluded, each successful family gets a second engineering pass, and only then does the orchestrator allocate deeper rounds and cross-tier composition. See [`docs/orchestrated-search.md`](docs/orchestrated-search.md).
+
+Search-time hardware and deployment-time resources are separate contracts:
+
+```py
+resources = ap.Resources(
+    search=ap.SearchResources(
+        max_parallel_agents=4,
+        max_dollars_per_agent_call=0.05,  # reserves in-flight budget headroom
+        pi_local=True,  # required here because external_egress=False below
+        allow_package_installs=True,
+        allow_model_downloads=True,
+    ),
+    runtime=ap.RuntimeResources(
+        network=True,
+        api_providers=("openai",),
+        max_dollars_per_call=0.002,
+    ),
+    data=ap.DataPolicy(external_egress=False),
+    confirmed=True,
+)
+
+prepared = translate.prepare(
+    pairs_df, resources=resources, budget=ap.Budget(dollars=2)
+)
+prepared.show_metric_suite()
+prepared.demonstrate_metrics([...])
+prepared.approve_metrics("user")
+report = prepared.optimize(ap.Budget(dollars=20))
+```
+
+Hardware can be detected, but AutoProgramming never interprets an API key, network connection, or installed GPU as permission to send data or require that resource in production. Resource profiles store capabilities and provider names, never secrets. Under a dollar budget, Pi calls are serialized unless `max_dollars_per_agent_call` is confirmed; with that bound, each parallel call reserves headroom and settles its actual reported cost before more work launches. For unattended runs, pass an explicit `PiOrchestratorBackend(orchestrator_model=..., worker_model=..., orchestrator_timeout=..., worker_timeout=...)` to avoid inheriting an unexpectedly slow global Pi model/thinking configuration.
+
+Metric suites distinguish **acceptance lenses** (user-approved and eligible to choose the final program) from **diagnostic lenses** (orchestrator-managed search feedback). Suite-aware search uses acceptance floors and a Pareto frontier rather than requiring one weighted scalar. The legacy primary remains a report headline for older workspaces.
 
 ## Data discipline
 
@@ -85,8 +128,10 @@ translate_ap/
 ├── active.json             # which candidate is live + pinned eval scores
 ├── data/
 │   ├── train.csv
-│   ├── val.csv
-│   └── test.csv            # harness-controlled; agent cannot eval against it
+│   ├── val.csv              # legacy/manual workspaces
+│   └── test.csv             # legacy/manual workspaces
+# Resource-confirmed Pi runs keep val/test in controller-private storage,
+# outside this coding-agent workspace.
 ├── candidates/
 │   ├── candidate_0.py      # seed
 │   ├── candidate_1.py      # mutated from 0
@@ -221,6 +266,7 @@ prg.eval("candidate_0")                      # score on val (aggregate only, wit
 prg.eval("candidate_0", split="train", per_instance=True)   # per-row, train only
 prg.run("candidate_0", split="train", row=17)  # single traced run — train rows only
 prg.frontier()                               # Pareto frontier: best candidate per train row
+prg.tradeoffs()                              # quality / cost / latency frontier
 prg.data.train                               # readable
 prg.data.val                                 # scoring only — rows not readable
 prg.budget                                   # remaining dollars / eval calls / time
@@ -264,7 +310,10 @@ Input keys are parameter names; output keys are output type names (guaranteed un
 **Distill** — compress the current program into something cheaper. Logs are perfect for this: the program's own outputs *are* the training target, because the goal is imitation:
 
 ```py
-translate.distill(model="gpt-4.1-nano", data="logs", output="translate_ft_ap")
+translate.distill(
+    model="gpt-4.1-nano", data="logs", output="translate_ft_ap",
+    budget=ap.Budget(dollars=5),
+)
 ```
 
 **Re-optimize** — make the program *better*. Logs alone cannot do this: they record what the current program predicted, and optimizing toward your own outputs reinforces your own errors. Re-optimization requires a correction signal:
@@ -287,7 +336,7 @@ It's a package with a `pyproject.toml`, so it distributes like one:
 pip install ./translate_ap          # deps of the active candidate install automatically
 ```
 
-Heavy candidates keep their weights in `artifacts/` (tracked with git-lfs) or declare a download step in their PEP 723 block (`[tool.ap] fetch = ["huggingface:Helsinki-NLP/opus-mt-en-fr"]`) that runs on first use. Zipping the directory works too — `artifacts/` goes with it.
+Heavy candidates keep their weights in `artifacts/` (tracked with git-lfs). A PEP 723 hint such as `[tool.ap] fetch = ["huggingface:Helsinki-NLP/opus-mt-en-fr"]` records the artifact source for tooling, but candidates must currently implement their own lazy first-use download. Zipping the directory works too — `artifacts/` goes with it.
 
 ## Building a program conversationally
 

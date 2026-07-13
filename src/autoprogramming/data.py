@@ -168,6 +168,27 @@ def split_rows(rows, seed: int = 0, ratios=DEFAULT_RATIOS) -> dict[str, list[dic
     }
 
 
+def development_partition(
+    rows: list[dict], *, seed: int = 0, probe_ratio: float = 0.2
+) -> tuple[list[dict], list[dict]]:
+    """Split the train split into worker-visible fit and controller-only probe.
+
+    This does not alter val/test and is deterministic for the workspace seed.
+    Very small train sets keep all rows visible because withholding one would
+    leave too little implementation context; bootstrap mode already caps search.
+    """
+    if not 0.0 <= probe_ratio < 1.0:
+        raise DataDisciplineError(
+            f"probe_ratio must be in [0, 1), got {probe_ratio!r}."
+        )
+    copied = [dict(row) for row in rows]
+    if len(copied) < 5 or probe_ratio == 0:
+        return copied, []
+    random.Random(seed ^ 0xA17E).shuffle(copied)
+    n_probe = max(1, round(len(copied) * probe_ratio))
+    return copied[n_probe:], copied[:n_probe]
+
+
 def write_csv(path, rows, columns) -> None:
     """Write rows to a UTF-8 CSV with ``columns`` as the header row."""
     path = Path(path)
@@ -191,7 +212,12 @@ def load_split(workspace, split: str) -> list[dict[str, str]]:
     Internal accessor for the scoring harness and finalize(); it carries no
     guard of its own — refusals are guards.py's job, this just reads.
     """
-    return read_csv(Path(workspace.data_dir) / f"{split}.csv")
+    path = (
+        workspace.split_path(split)
+        if hasattr(workspace, "split_path")
+        else Path(workspace.data_dir) / f"{split}.csv"
+    )
+    return read_csv(path)
 
 
 class Rows:

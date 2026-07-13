@@ -8,6 +8,7 @@ split — evaluated exactly once, at the end, on the top candidates only.
 
 from __future__ import annotations
 
+import contextlib
 import getpass
 import json
 import os
@@ -155,8 +156,8 @@ class FinalReport:
                 for e in alts
             )
             lines.append(
-                f"activated {self.activated} as the best-primary frontier default; "
-                f"cheaper/faster frontier alternatives: {names}"
+                f"activated {self.activated} under the precommitted frontier "
+                f"preference; quality/cost frontier alternatives: {names}"
             )
         else:
             lines.append(
@@ -231,7 +232,9 @@ class AgentHarness:
         schema = ws.schema
         row_dict = rows[row]
         result = run_candidate(ws, cand, schema.coerce_inputs(row_dict))
-        ledger.charge(eval_calls=1, dollars=result.cost_dollars or 0.0)
+        ledger.charge(
+            eval_calls=1, dollars=result.cost_dollars or 0.0, category="candidate"
+        )
         expected = schema.coerce_expected(row_dict)
         score: float | None = None
         if metric_mod.is_approved(ws):
@@ -330,7 +333,25 @@ class AgentHarness:
             "AP_AUTO_APPROVE_METRIC=1 to accept it as-is.\n" + table
         )
 
-    def finalize(self, top_k: int = 2) -> FinalReport:
+    def approve_metric_suite(self, approved_by: str, suite, *, weights=None) -> None:
+        """Approve metric roles and the precommitted selection policy.
+
+        This is the non-interactive counterpart to ``propose_metric``: the
+        orchestrator may propose several lenses, but a user still signs off on
+        which are acceptance criteria. Diagnostic lenses guide search only.
+        """
+        from .objectives import approve_suite
+
+        approve_suite(self._workspace, approved_by, suite, weights=weights)
+
+    @property
+    def metric_suite(self):
+        """The approved suite, with old metrics treated as all-acceptance."""
+        from .objectives import metric_suite
+
+        return metric_suite(self._workspace)
+
+    def finalize(self, top_k: int | None = None) -> FinalReport:
         """The one-time test evaluation: score the top val candidates on test,
         demote overfitters, activate the winner, and seal the workspace.
 
@@ -358,11 +379,37 @@ class AgentHarness:
                 "evaluation. Selection happens on val — score at least one "
                 "candidate first: prg.eval('candidate_0')."
             )
+        # Scores select exact source, not a mutable filename. Also run the
+        # source-only memorization rule even when an agent skipped train eval;
+        # val-only candidates must not bypass lookup-table detection.
+        stale = [
+            n for n in val_scored
+            if _val_stats(scores, n) is not None
+            and not scoring.score_provenance_current(ws, n, "val")
+        ]
+        train_rows_for_check = data_mod.load_split(ws, "train")
+        for name in val_scored:
+            stats = _val_stats(scores, name)
+            if stats is None or name in stale:
+                continue
+            cand = candidates_mod.load_candidate(ws, name)
+            source_flags = guards.memorization_check(
+                cand.source, float(stats["mean"]), float(stats["mean"]),
+                train_rows_for_check, ws.schema,
+            )
+            if source_flags:
+                scores.setdefault("flags", {}).setdefault(name, [])
+                for flag in source_flags:
+                    if flag not in scores["flags"][name]:
+                        scores["flags"][name].append(flag)
+        if stale or scores != scoring.load_scores(ws):
+            scoring.save_scores(ws, scores)
+
         flags = scores.get("flags", {})
         flagged = {n: flags[n] for n in val_scored if flags.get(n)}
         eligible = [
             n for n in val_scored
-            if n not in flagged and _val_stats(scores, n) is not None
+            if n not in flagged and n not in stale and _val_stats(scores, n) is not None
         ]
         if not eligible:
             if flagged:
@@ -382,10 +429,48 @@ class AgentHarness:
                 "selection has real numbers to promote from."
             )
 
-        top = sorted(
-            eligible,
-            key=lambda n: (-_val_stats(scores, n)["mean"], _cand_key(n)),
-        )[: max(1, top_k)]
+        # New metric suites promote the VAL Pareto frontier rather than merely
+        # the two highest points on one scalar. Legacy approvals preserve the
+        # old top-2 behavior.
+        from .objectives import (
+            meets_floors,
+            metric_suite,
+            preference_key,
+            selection_goals,
+        )
+
+        suite = metric_suite(ws)
+        approval = json.loads(ws.metric_approval.read_text())
+        suite_aware = isinstance(approval.get("suite"), dict)
+        if suite_aware:
+            val_vectors = {
+                name: {
+                    objective: float(stats["mean"])
+                    for objective, stats in _val_stats(scores, name).get("objectives", {}).items()
+                    if objective in selection_goals(suite)
+                }
+                for name in eligible
+            }
+            floor_ok = {
+                name: vector for name, vector in val_vectors.items()
+                if meets_floors(vector, suite)
+            }
+            pool = floor_ok or val_vectors
+            frontier_names = scoring.pareto_nondominated(
+                scoring._domination_points(pool), selection_goals(suite)
+            )
+            ordered = sorted(
+                frontier_names,
+                key=lambda n: (preference_key(pool[n], suite), _cand_key(n)),
+            )
+            limit = top_k if top_k is not None else suite.policy.max_test_finalists
+            top = _diverse_finalists(ws, ordered, max(1, limit))
+        else:
+            limit = 2 if top_k is None else top_k
+            top = sorted(
+                eligible,
+                key=lambda n: (-_val_stats(scores, n)["mean"], _cand_key(n)),
+            )[: max(1, limit)]
 
         schema = ws.schema
         test_rows = data_mod.load_split(ws, "test")
@@ -402,21 +487,44 @@ class AgentHarness:
             cand = candidates_mod.load_candidate(ws, name)
             n_repeats = 1 if cand.deterministic else scoring.DEFAULT_REPEATS
             cache_rows: dict[str, list[dict]] = {}
-            for i, row_dict in enumerate(test_rows):
-                inputs = schema.coerce_inputs(row_dict)
-                reps_list: list[dict] = []
-                for _ in range(n_repeats):
-                    result = run_candidate(ws, cand, inputs)
-                    if ledger is not None:
-                        ledger.charge(eval_calls=1, dollars=result.cost_dollars or 0.0)
-                    reps_list.append(scoring._run_cache_entry(result))
-                cache_rows[f"row_{i}"] = reps_list
+            from . import runner as runner_mod
+
+            session_cls = (
+                getattr(runner_mod, "CandidateSession", None)
+                if run_candidate is runner_mod.run_candidate
+                else None
+            )
+            session_context = (
+                session_cls(ws, cand)
+                if session_cls is not None
+                else contextlib.nullcontext(None)
+            )
+            with session_context as candidate_session:
+                run_one = (
+                    candidate_session.run
+                    if candidate_session is not None
+                    else lambda inputs: run_candidate(ws, cand, inputs)
+                )
+                for i, row_dict in enumerate(test_rows):
+                    inputs = schema.coerce_inputs(row_dict)
+                    reps_list: list[dict] = []
+                    for _ in range(n_repeats):
+                        result = run_one(inputs)
+                        if ledger is not None:
+                            ledger.charge(
+                                eval_calls=1,
+                                dollars=result.cost_dollars or 0.0,
+                                category="candidate",
+                            )
+                        reps_list.append(scoring._run_cache_entry(result))
+                    cache_rows[f"row_{i}"] = reps_list
             scoring.write_output_cache(ws, cand, "test", cache_rows)
             sub = scoring._aggregate_from_cache(
                 cache_rows, metrics, primary, schema, weights,
                 expected_by_row, n_repeats,
             )
-            test_mean = sub["mean"]  # primary
+            sub["candidate_sha"] = scoring._source_sha(ws, cand)
+            test_mean = sub["mean"]  # compatibility headline
             objectives = {o: v["mean"] for o, v in sub["objectives"].items()}
 
             stats = _val_stats(scores, name)
@@ -437,6 +545,7 @@ class AgentHarness:
                 "note": note,
                 "objectives": objectives,
                 "frontier": False,
+                "cold_start_s": sub.get("cold_start_s"),
             })
 
         entries.sort(key=lambda e: (-e["test_mean"], _cand_key(e["candidate"])))
@@ -446,8 +555,11 @@ class AgentHarness:
         # rounded for domination so wall-clock latency jitter cannot flip which
         # finalists are reported on the frontier run to run.
         points = {e["candidate"]: e["objectives"] for e in entries}
-        goals = {name: "max" for name in metrics}
-        goals.update(COST_OBJECTIVES)
+        goals = (
+            selection_goals(suite)
+            if suite_aware
+            else ({**{name: "max" for name in metrics}, **COST_OBJECTIVES})
+        )
         frontier = set(scoring.pareto_nondominated(
             scoring._domination_points(points), goals
         ))
@@ -461,7 +573,16 @@ class AgentHarness:
         frontier_survivors = [e for e in survivors if e["frontier"]]
         frontier_entries = [e for e in entries if e["frontier"]]
         pool = frontier_survivors or frontier_entries or entries
-        winner = min(pool, key=lambda e: (-e["test_mean"], _cand_key(e["candidate"])))
+        if suite_aware:
+            winner = min(
+                pool,
+                key=lambda e: (
+                    preference_key(e["objectives"], suite),
+                    _cand_key(e["candidate"]),
+                ),
+            )
+        else:
+            winner = min(pool, key=lambda e: (-e["test_mean"], _cand_key(e["candidate"])))
         if not survivors:
             winner["note"] += (
                 "; every finalist overfit to val — activated on best test "
@@ -558,3 +679,34 @@ def _cand_key(name: str):
 
 def _row_key(row_id: str):
     return _cand_key(row_id)
+
+
+def _diverse_finalists(workspace, ordered: list[str], limit: int) -> list[str]:
+    """Prefer one val-frontier representative per approach tier before repeats."""
+    path = getattr(workspace, "portfolio_json", None)
+    if path is None or not path.exists():
+        return ordered[:limit]
+    try:
+        portfolio = json.loads(path.read_text())
+        tiers = {
+            candidate: int(avenue["spec"]["tier"])
+            for avenue in portfolio.get("avenues", [])
+            for candidate in avenue.get("candidates", [])
+        }
+    except (OSError, ValueError, KeyError, TypeError):
+        return ordered[:limit]
+    selected: list[str] = []
+    seen_tiers: set[int] = set()
+    for name in ordered:
+        tier = tiers.get(name)
+        if tier is not None and tier not in seen_tiers:
+            selected.append(name)
+            seen_tiers.add(tier)
+            if len(selected) >= limit:
+                return selected
+    for name in ordered:
+        if name not in selected:
+            selected.append(name)
+            if len(selected) >= limit:
+                break
+    return selected

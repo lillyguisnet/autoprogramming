@@ -38,7 +38,9 @@ prg.data          # SplitView(train=<n>, val=<n>)
   specific val examples.
 - There is **no `prg.data.test`** attribute at all, and no
   `prg.eval(split="test")`. Test belongs to `finalize()` — evaluated exactly
-  once, at the end. `data/test.csv` is written chmod 400.
+  once, at the end. Resource-confirmed runs store val/test in controller-private
+  storage outside the coding-agent workspace; legacy/manual workspaces retain
+  their CSV layout.
 
 ## Metric first: `propose_metric`
 
@@ -65,9 +67,11 @@ prg.propose_metric(code: str, examples: list[tuple],
   dicts for multi-output) scored under **every** quality metric and shown as a
   demonstration table (one column per metric, primary marked). Pick 3+ that show
   their judgment: an exact match, a near miss (synonym/rounding), a clear failure.
-- `primary` — the name of the headline quality metric that drives val ranking,
-  the default activation, and the top-line number. `None` lets the library pick
-  (the sole metric, else the first `METRICS` key).
+- `primary` — the compatibility headline used by top-level report fields and
+  the default `compare()` objective. For legacy approvals it also drives val
+  ranking and activation. Approved metric suites instead select from their
+  acceptance frontier under the precommitted policy. `None` lets the library
+  pick (the sole metric, else the first `METRICS` key).
 - Returns `True` once approved (interactive terminal sign-off, or the
   `AP_AUTO_APPROVE_METRIC` env var — see below). Returns the user's feedback
   **string** when they push back: revise the code and propose again. Raises
@@ -77,9 +81,20 @@ prg.propose_metric(code: str, examples: list[tuple],
 
 ```py
 import autoprogramming as apm
+# Legacy/all-acceptance approval:
 apm.metric.approve(prg.workspace, "user name", weights=None, primary="chrF")
-# primary — which quality metric is the headline; must name a defined metric
-#   (or None). Config, not code: changing it never invalidates scores.
+
+# Suite-aware approval (preferred for orchestrated search):
+suite = apm.MetricSuite(
+    acceptance=("chrF",),
+    diagnostic=("exact",),
+    policy=apm.SelectionPolicy(
+        floors={"chrF": 0.75}, preference_order=("chrF",)
+    ),
+)
+apm.approve_suite(prg.workspace, "user name", suite, weights=None)
+
+# primary — compatibility headline; must name a defined metric (or None).
 # weights (multi-output only): {"Answer": 2.0, "Confidence": 1.0} — the per-field
 #   aggregate weighting, part of the sign-off; must sum positive. Aggregate score
 #   is the weighted mean of the per-field scores.
@@ -99,8 +114,10 @@ Facts that matter:
   survive untouched. The edit still voids the approval (`MetricChangedError` on the
   next scoring attempt until re-approved). Re-proposing byte-identical code is a
   no-op that keeps everything.
-- **Primary and weights are config, not code.** Changing which metric is primary,
-  or re-weighting, never changes `metric_sha` and so never invalidates a score.
+- **Headline primary and weights are config, not code.** Changing either never
+  changes `metric_sha` and so never invalidates cached outputs. Suite acceptance
+  roles, floors, and preference order are additionally frozen once val selection
+  starts; changing those requires a fresh workspace.
 - `AP_AUTO_APPROVE_METRIC=1` (or `true`/`yes`) auto-approves an unapproved
   metric for unattended runs. It never re-approves a metric that changed after
   sign-off. Do not set it to dodge the sign-off conversation with a present user.
@@ -203,8 +220,8 @@ Every eval is **multi-objective**: the single run per (row, repeat) is scored
 under every quality metric, and `cost_dollars` + `latency_s` are read off the
 same run (lower is better). Extra quality metrics therefore add no runs.
 
-`EvalReport` fields — the top-level ones are the **primary** quality metric's,
-exactly as before: `candidate`, `split`, `mean`, `std`,
+`EvalReport` fields — for compatibility, the top-level ones are the headline
+**primary** quality metric's: `candidate`, `split`, `mean`, `std`,
 `ci95: (lo, hi)` (seeded bootstrap over per-row means), `n_rows`, `n_repeats`,
 `repeat_variance`, `per_row` (train + `per_instance=True` only, else `None`),
 `per_field` (multi-output aggregates or `None`), `errors` (failed-run
@@ -256,9 +273,10 @@ returned to you.)
   names the objective if either candidate lacks stored scores for it.
 
 **"Improved" means the CI excludes zero.** A point estimate going up is not a
-win; do not keep a mutation `compare()` cannot distinguish from noise. (For a
-cost objective the boolean still means the CI of `b - a` is above zero — i.e.
-`b` costs MORE; read the sign, don't just trust the flag.)
+win; do not keep a mutation `compare()` cannot distinguish from noise. For a
+minimized cost objective, `improved=True` means the CI of `b - a` is entirely
+**below** zero: the challenger is reliably cheaper/faster. Unknown cost cannot
+be compared and is never treated as zero.
 
 ## Tradeoffs: `tradeoffs`
 
@@ -292,7 +310,7 @@ that win different rows are prime material for a merged/pipeline candidate.
 ## Finish: `finalize`
 
 ```py
-prg.finalize(top_k=2) -> FinalReport
+prg.finalize(top_k=None) -> FinalReport
 ```
 
 The **only** code path that reads the test split, run once per workspace:
@@ -300,20 +318,23 @@ The **only** code path that reads the test split, run once per workspace:
 1. Requires an approved metric and at least one val-scored candidate
    (else `NotOptimizedError`). Memorization-flagged candidates are excluded;
    if every val-scored candidate is flagged, finalize refuses.
-2. Takes the `top_k` eligible candidates by val mean and evaluates each on
-   every test row (1 repeat if deterministic, else 3). Charges the budget but
-   never checks it — the report card happens even on an exhausted budget.
+2. Legacy metrics take the top two eligible candidates by val mean. Approved
+   metric suites instead take up to `policy.max_test_finalists` candidates from
+   the acceptance/cost val Pareto frontier, preferring distinct approach tiers;
+   explicit `top_k` overrides the cap. Evaluates each on every test row (1 repeat
+   if deterministic, else 3). Charges the budget but never checks it.
 3. Scores every finalist on **all objectives** from the shared test runs
    (quality metrics + `cost_dollars` + `latency_s`) and computes the Pareto
    frontier over those TEST objective vectors.
-4. Demotes any finalist whose val-to-test drop (on the **primary**) exceeds
-   `max(0.05, half the width of its val CI)` — that is overfitting to val,
-   reported loudly, never hidden.
-5. Activates the **best-primary candidate that is on the frontier and not
-   demoted** (fallbacks: best-primary on the frontier, then best primary overall
-   with a loud note — always exactly one). Writes `final_report.json` and
-   rewrites `active.json` + `pyproject.toml` so the shipped package runs the
-   winner with exactly its runtime deps.
+4. Demotes any finalist whose val-to-test drop on the compatibility headline
+   exceeds `max(0.05, half the width of its val CI)` — that is overfitting to
+   val, reported loudly, never hidden.
+5. For suites, activates the non-demoted test-frontier point chosen by the
+   precommitted acceptance preference, then cost/latency tie-breakers. Legacy
+   workspaces retain best-primary activation. If every finalist is demoted, the
+   report uses the corresponding frontier fallback with a loud note. Writes
+   `final_report.json` and rewrites `active.json` + `pyproject.toml` so the
+   shipped package runs the winner with exactly its runtime deps.
 
 `FinalReport`: `entries` (per finalist: `candidate`, `val_mean`, `test_mean`,
 `gap`, `demoted`, `note` — all **primary**, back-compat — plus
@@ -323,7 +344,7 @@ The **only** code path that reads the test split, run once per workspace:
 "test scores (evaluated once):" and "activated:" lines, then appends a
 "quality / cost tradeoffs:" table (a `*` on frontier members) and a closing line
 naming the activated default and the cheaper/faster frontier alternatives with
-the exact `ws.activate("<name>", <primary test mean>)` call to switch. Present
+the exact `ws.activate("<name>", <headline test mean>)` call to switch. Present
 that frontier to the user — do not hand them only the single most-accurate
 candidate.
 
@@ -360,10 +381,10 @@ Soft signals (warnings, not errors):
 
 ## The loop
 
-0. **Metric set + primary sign-off** — `propose_metric(code, examples,
-   primary=...)` before any eval. Add a graded lens if a strict one gives a
-   family a flat, zero-gradient score. Editing metric code later re-scores from
-   cache; changing primary/weights invalidates nothing.
+0. **Metric-suite sign-off** — propose and demonstrate every lens before any
+   eval, classify acceptance vs diagnostic roles, and precommit floors and
+   preference order. `propose_metric(..., primary=...)` remains the legacy
+   all-acceptance path. Add a graded diagnostic if a strict lens is flat.
 1. **Survey the ladder, seed a diverse portfolio.** Check current tools (do not
    trust remembered "latest" models), then create several genuinely distinct
    candidates across cost tiers — a model call, a classical head, a rules
@@ -380,6 +401,6 @@ Soft signals (warnings, not errors):
 4. **Watch the frontier, not one number.** Check `prg.budget` between iterations
    and stop when the quality/cost frontier stops advancing (a new candidate no
    longer joins or displaces it), not merely when a single metric plateaus.
-5. **`prg.finalize()`** — one-time test eval, activation of the best-primary
-   frontier default, sealed report. Present the tradeoff frontier and the
-   one-liner to switch to a cheaper/faster alternative.
+5. **`prg.finalize()`** — one-time test eval, activation of the precommitted
+   frontier default (best-primary only for legacy approvals), sealed report.
+   Present the tradeoff frontier and the one-liner to switch alternatives.

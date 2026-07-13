@@ -29,6 +29,8 @@ def test_budget_requires_at_least_one_unit():
         {"minutes": 0},
         {"minutes": -5.0},
         {"dollars": 5, "eval_calls": -1},
+        {"dollars": float("nan")},
+        {"minutes": float("inf")},
     ],
 )
 def test_budget_units_must_be_positive(kwargs):
@@ -136,6 +138,20 @@ def test_minutes_limit_via_persisted_clock(path):
         reopened.check()
 
 
+def test_categorized_spend_preserves_public_shape_and_restart(path):
+    ledger = BudgetLedger.start(path, Budget(dollars=10))
+    ledger.charge(dollars=1.25, category="agent")
+    ledger.charge(eval_calls=2, dollars=0.5, category="candidate")
+    assert ledger.spent["dollars"] == pytest.approx(1.75)
+    assert set(ledger.spent) == {"dollars", "eval_calls", "minutes"}
+    assert ledger.breakdown == {
+        "agent": {"dollars": 1.25, "eval_calls": 0},
+        "candidate": {"dollars": 0.5, "eval_calls": 2},
+    }
+    restarted = BudgetLedger.start(path, Budget(dollars=20))
+    assert restarted.breakdown == ledger.breakdown
+
+
 def test_start_preserves_spend_and_restarts_clock(path):
     ledger = BudgetLedger.start(path, Budget(dollars=5))
     ledger.charge(dollars=1.5, eval_calls=2)
@@ -151,6 +167,52 @@ def test_start_preserves_spend_and_restarts_clock(path):
     assert restarted.limits == {"dollars": 10, "eval_calls": None, "minutes": 5}
     assert restarted.elapsed_minutes() < 1
     assert restarted.remaining()["dollars"] == pytest.approx(8.5)
+
+
+def test_negative_charges_are_refused(path):
+    ledger = BudgetLedger.start(path, Budget(dollars=1))
+    with pytest.raises(BudgetError, match="non-negative"):
+        ledger.charge(dollars=-1)
+    with pytest.raises(BudgetError, match="non-negative"):
+        ledger.charge(eval_calls=-1)
+    with pytest.raises(BudgetError, match="finite"):
+        ledger.charge(dollars=float("nan"))
+
+
+def test_dollar_reservation_reduces_headroom_and_settles_actual_spend(path):
+    ledger = BudgetLedger.start(path, Budget(dollars=10))
+    token = ledger.reserve_dollars(4, category="agent")
+    assert ledger.spent["dollars"] == 0
+    assert ledger.remaining()["dollars"] == pytest.approx(6)
+    assert ledger.reservations[token]["dollars"] == 4
+    with pytest.raises(BudgetExceededError, match="Cannot reserve"):
+        ledger.reserve_dollars(7, category="agent")
+
+    ledger.settle_reservation(token, dollars=2.5)
+    assert ledger.reservations == {}
+    assert ledger.spent["dollars"] == pytest.approx(2.5)
+    assert ledger.remaining()["dollars"] == pytest.approx(7.5)
+    assert ledger.breakdown["agent"]["dollars"] == pytest.approx(2.5)
+
+
+def test_reservations_can_be_released_and_stale_ones_clear_on_restart(path):
+    ledger = BudgetLedger.start(path, Budget(dollars=5))
+    released = ledger.reserve_dollars(2)
+    ledger.release_reservation(released)
+    assert ledger.remaining()["dollars"] == pytest.approx(5)
+
+    ledger.reserve_dollars(3)
+    restarted = BudgetLedger.start(path, Budget(dollars=5))
+    assert restarted.reservations == {}
+    assert restarted.remaining()["dollars"] == pytest.approx(5)
+
+
+def test_fully_reserved_budget_blocks_additional_work(path):
+    ledger = BudgetLedger.start(path, Budget(dollars=2))
+    ledger.reserve_dollars(2)
+    assert ledger.exhausted() == "dollars"
+    with pytest.raises(BudgetExceededError, match="Budget exhausted"):
+        ledger.check()
 
 
 def test_ledger_refuses_accounting_before_start(path):

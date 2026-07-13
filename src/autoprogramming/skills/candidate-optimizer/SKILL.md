@@ -1,9 +1,26 @@
 ---
 name: candidate-optimizer
-description: Optimize candidate implementations inside an autoprogramming workspace. Use when the working directory (or a nearby one, typically named like translate_ap or another *_ap package) contains active.json, schema.py, candidates/, and scores.json, or when asked to optimize, improve, evaluate, or add candidates for an autoprogramming program. Covers attaching via ap.attach, surveying the approach ladder and seeding a diverse portfolio across cost tiers, composing pretrained models as pipeline stages, multi-metric sign-off with a primary, the quality/cost tradeoff frontier, the train/val/test data discipline, PEP 723 candidate file conventions, and honest budget accounting.
+description: Optimize candidate implementations inside an autoprogramming workspace. Use when the working directory (or a nearby one, typically named like translate_ap or another *_ap package) contains active.json, schema.py, candidates/, and scores.json, or when asked to optimize, improve, evaluate, or add candidates for an autoprogramming program. Covers attaching via ap.attach, surveying the approach ladder and seeding a diverse portfolio across cost tiers, composing pretrained models as pipeline stages, acceptance/diagnostic metric-suite sign-off, the quality/cost tradeoff frontier, the train/val/test data discipline, PEP 723 candidate file conventions, and honest budget accounting.
 ---
 
 # Candidate optimizer for autoprogramming workspaces
+
+## Role boundary
+
+When the Pi portfolio backend is active, the main session is an **orchestrator**:
+it plans and allocates avenues but never implements candidates itself. The
+trusted Python controller launches implementation-only Pi workers with generic
+task briefs and isolated directories. Do not send those workers `prg`, optimizer
+terminology, metric code/names/weights, scores, other candidates, val, or test.
+They should know only their function contract, dev-fit examples, assigned
+mechanism, resource envelope, and their own prior files.
+
+Do not finalize merely because one avenue is acceptable. Controller policy
+requires every resource-feasible tier to be attempted or explicitly excluded,
+a second configuration per successful family, then a score-informed deepening
+and cross-tier composition round. Metric suites separate user-approved
+acceptance lenses from search-only diagnostics; approach novelty is a portfolio
+gate, not a quality metric.
 
 You are optimizing one typed program by writing, evaluating, and evolving
 complete candidate implementations — plain Python files — under a strict data
@@ -55,7 +72,7 @@ Read per-workspace facts live from the workspace, not from memory:
     prg.compare("candidate_0", "candidate_1", objective="cost_dollars")  # any objective
     prg.tradeoffs()                              # the quality/cost Pareto frontier
     prg.frontier()                               # Pareto frontier over train rows
-    prg.finalize(top_k=2)                        # one-time test eval + activation — LAST
+    prg.finalize()                               # suite policy chooses finalists — LAST
 
 ## Survey the approach ladder before you commit
 
@@ -105,56 +122,40 @@ checkpoint) instead of the one that ships today. Verify a model actually exists
 and LOADS before you build a candidate around it — a candidate wired to a model
 that no longer resolves is a wasted iteration.
 
-## Step 0: the metric set and primary — metric sign-off before ANY scoring
+## Step 0: metric suite sign-off before ANY scoring
 
-The entire search optimizes whatever metric.py says; a wrong metric produces a
-confidently-scored wrong program. Metrics are a set of LENSES, and using several
-is normal and cheap — every candidate is scored on all of them from ONE run, so
-extra quality metrics cost ~nothing.
+A wrong metric produces a confidently wrong program. Propose several independent
+lenses from one shared run, then classify each as **acceptance** (user-approved,
+eligible for final selection) or **diagnostic** (search guidance only). Never
+collapse them into one convenient scalar merely because it is easy to optimize.
 
-1. Write the metric source. Either a single `def metric(predicted, expected)`
-   (single-output returns a float; multi-output returns a dict keyed by output
-   names), OR a `METRICS = {"<name>": fn, ...}` dict of several named quality
-   metrics. Names must be non-empty, unique, and must not collide with the cost
-   objectives `cost_dollars` / `latency_s`.
-2. Pick 3+ real (predicted, expected) pairs that show judgment: an exact match, a
-   near miss (synonym / rounding), and a clear failure.
-3. Call `prg.propose_metric(code, examples, primary="<name>")`. The demo table
-   shows one column per quality metric with the primary marked, so the user signs
-   off on the whole set at once. Three outcomes:
-   - True — approved; proceed.
-   - A string — user feedback; revise and propose again.
-   - MetricNotApprovedError — stdin is not a terminal and AP_AUTO_APPROVE_METRIC
-     is unset, so nobody could sign off. The metric WAS written; only sign-off is
-     missing. Surface the demonstration table from the error to the user, and on
-     their approval record it:
+1. Write `metric.py` with `METRICS = {"<name>": fn, ...}` (or the legacy single
+   `metric`). Names must not collide with `cost_dollars` / `latency_s`.
+2. Have an independent metric critic attack proxy hacking, flat exact-match,
+   format blindness, semantic blindness, robustness gaps, and evaluator
+   self-preference.
+3. Demonstrate every lens on 3+ real exact/near-miss/failure pairs. Iterate with
+   the user until judgments match.
+4. Construct `ap.MetricSuite(acceptance=(...), diagnostic=(...),
+   policy=ap.SelectionPolicy(floors=..., preference_order=...))` and call
+   `prg.approve_metric_suite("<approver>", suite, weights=...)` only after the
+   user approves. AP_AUTO_APPROVE_METRIC is for deliberately unattended runs,
+   never a way to impersonate a reachable user.
 
-         import autoprogramming as apm
-         apm.metric.approve(prg.workspace, "<approver>", primary="<name>")
-         # multi-output: also pass weights={"Answer": 2.0, "Confidence": 1.0}
-
-     AP_AUTO_APPROVE_METRIC=1 auto-approves for fully unattended runs. Never use
-     either path to dodge the sign-off conversation when a user is reachable.
-
-The **primary** is the headline quality metric: it drives val ranking, the
-default activation, and the top-line number you report. Primary and weights are
-config, not code — changing which metric is primary or re-weighting does NOT
-invalidate any scores. Editing a metric's CODE re-scores candidates from cached
-outputs, not by re-running them; only a candidate whose own code changed needs a
-re-run.
-
-Diagnose a stuck loop through the lens set: a flat metric (hard exact-match)
-gives a whole family a zero gradient and hides real progress. Add a graded metric
-to SEE intra-family movement, and make it primary if the strict one is the wrong
-compass — but never silently optimize a different thing than you report. The
-primary is what the headline number means.
+Acceptance roles, floors, and preference order are precommitted before val and
+cannot change after selection starts. Diagnostic lenses may evolve; editing
+metric code re-scores unchanged candidate bundles from cached outputs. A flat
+strict metric should become a diagnostic beside a graded lens, not force every
+implementation worker to game exact match. Implementation workers see neither
+kind of metric.
 
 ## Cost is an objective
 
-`cost_dollars` and `latency_s` are measured automatically off every run (lower is
-better) — no metric.py involvement. Every `prg.eval` reports them alongside the
-quality metrics, so you always know what a candidate costs. The goal is the best
-quality PER cost, not perfection at any price.
+`latency_s` is measured automatically. `cost_dollars` comes from
+`AP_COST_DOLLARS` or declared `cost_per_call`; an omitted report is unknown and
+never treated as free (lower is better) — no metric.py involvement. Every
+`prg.eval` reports these alongside quality metrics. The goal is the best quality
+per known cost, not perfection at any price.
 
 - During the loop, read `prg.tradeoffs()` to see the quality/cost Pareto frontier
   over evaluated candidates — the set where no other candidate beats it on every
@@ -166,8 +167,8 @@ quality PER cost, not perfection at any price.
 - Present the USER the frontier, not just the single most-accurate candidate:
   "here is the cheap-good one, the mid one, and the expensive-best one." Let them
   choose the point on the curve. `prg.finalize()` activates a sensible default
-  (the best-primary candidate on the frontier) and prints the cheaper/faster
-  frontier alternatives with the exact one-liner to switch to each.
+  (the point chosen by the precommitted acceptance preference) and reports the
+  remaining frontier alternatives.
 
 ## Data discipline (harness-enforced; violations raise, they don't warn)
 
@@ -216,8 +217,8 @@ quality PER cost, not perfection at any price.
 
 ## The loop
 
-0. **Metric set + primary sign-off** — `prg.propose_metric(code, examples,
-   primary=...)` before any eval. Add a graded lens if a strict one is flat.
+0. **Metric suite sign-off** — acceptance vs diagnostic roles, floors, and
+   preference committed before any eval. Add a graded diagnostic if strict is flat.
 1. **Survey the ladder, seed a diverse portfolio.** Check current tools, then
    create several genuinely distinct candidates across tiers (a model call, a
    classical head, a rules baseline, a pretrained-model-as-a-stage pipeline) —
@@ -234,8 +235,8 @@ quality PER cost, not perfection at any price.
 4. **Watch the frontier, not one number.** Check `prg.budget` between iterations;
    stop when the quality/cost frontier stops advancing (a new candidate no longer
    joins or displaces the frontier), not merely when a single metric plateaus.
-5. **prg.finalize()** — one-time test eval, activation of the best-primary
-   frontier default, sealed report. Present the tradeoff frontier to the user and
+5. **prg.finalize()** — one-time test eval, activation under the precommitted
+   frontier preference, sealed report. Present the tradeoff frontier to the user and
    the one-liner to switch to a cheaper/faster alternative. Do not skip finalize:
    an un-finalized workspace ships nothing.
 

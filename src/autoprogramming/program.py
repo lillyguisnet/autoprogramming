@@ -84,7 +84,8 @@ class Program:
     # ------------------------------------------------------------- optimize
 
     def optimize(self, data, budget: Budget | None = None, *, workspace=None,
-                 seed: int = 0, ratios=None, backend=None, _context=None):
+                 seed: int = 0, ratios=None, backend=None, resources=None,
+                 _context=None):
         """Launch the optimization agent on this program.
 
         ``data`` is a list of dict rows, a duck-typed DataFrame, a .csv/.jsonl
@@ -164,10 +165,40 @@ class Program:
                 root, self.schema, splits,
                 seed=seed, ratios=ratios, data_sha=sha,
                 bootstrap=len(rows) < BOOTSTRAP_MIN,
+                secure_data=resources is not None,
             )
 
-        BudgetLedger.start(ws.budget_json, budget)
+        if resources is not None:
+            from .resources import Resources
+
+            if not isinstance(resources, Resources):
+                raise TypeError(
+                    "resources= must be an ap.Resources profile separating "
+                    "search capabilities, deployment resources, and data policy."
+                )
+            resources.ensure_confirmed()
+            ws.secure_splits()
+            serialized = json.dumps(resources.to_dict(), indent=2) + "\n"
+            if ws.resources_json.exists() and ws.resources_json.read_text() != serialized:
+                existing_scores = json.loads(ws.scores_json.read_text())
+                if existing_scores.get("candidates"):
+                    raise DataDisciplineError(
+                        f"Refused to change resources for an active search in {ws.root}: "
+                        "resource availability determines which approach families and "
+                        "data-egress paths are legal. Start a new workspace for a new "
+                        "resource contract."
+                    )
+                # No implementation has been scored, so a resource correction
+                # may replace an unspent plan rather than wedging resume.
+                if ws.portfolio_json.exists():
+                    ws.portfolio_json.unlink()
+            ws.resources_json.write_text(serialized)
+
         self._workspace = ws
+        if resources is not None and ws.active.get("finalized"):
+            return self._load_final_report(ws)
+
+        BudgetLedger.start(ws.budget_json, budget)
 
         from . import guards
 
@@ -183,7 +214,14 @@ class Program:
 
         from .backend import default_backend
 
-        be = backend if backend is not None else default_backend()
+        if backend is not None:
+            be = backend
+        elif resources is not None and shutil.which("pi"):
+            from .pi_backend import PiOrchestratorBackend
+
+            be = PiOrchestratorBackend(resources=resources)
+        else:
+            be = default_backend()
         harness = AgentHarness(ws)
         try:
             be.run(harness, context=_context or {"mode": "optimize"})
@@ -194,7 +232,20 @@ class Program:
             return self._load_final_report(ws)
         scores = json.loads(ws.scores_json.read_text())
         if scores.get("val_scored"):
+            if ws.portfolio_json.exists():
+                from .portfolio import Portfolio
+
+                portfolio = Portfolio.load(ws.portfolio_json)
+                if not portfolio.may_finalize:
+                    print(
+                        "[autoprogramming] Pi search paused before finalization: "
+                        "portfolio breadth or a pending candidate journal is "
+                        "incomplete. Resume optimize() with a new explicit budget."
+                    )
+                    return None
             return harness.finalize()
+        if (_context or {}).get("prepare_only") or (_context or {}).get("mode") == "prepare":
+            return None
         print(
             f"[autoprogramming] no candidates were scored in {ws.root}; the "
             f"workspace is ready for a manual session. Attach and continue:\n"
@@ -203,6 +254,44 @@ class Program:
             f"then propose the metric, create candidates, eval, and finalize."
         )
         return None
+
+    def prepare(
+        self,
+        data,
+        budget: Budget | None = None,
+        *,
+        resources,
+        workspace=None,
+        seed: int = 0,
+        ratios=None,
+        backend=None,
+    ) -> "PreparedRun":
+        """Prepare resources and a metric proposal without dispatching workers.
+
+        Preparation has an explicit budget because the Pi metric/portfolio
+        analysis is itself an agent call. The returned object resumes against
+        the exact normalized rows and fixed workspace split after sign-off.
+        """
+        from .pi_backend import PiOrchestratorBackend
+
+        rows = self._resolve_rows(data)
+        selected_backend = backend or PiOrchestratorBackend(resources=resources)
+        self.optimize(
+            rows,
+            budget,
+            workspace=workspace,
+            seed=seed,
+            ratios=ratios,
+            backend=selected_backend,
+            resources=resources,
+            _context={"mode": "prepare", "prepare_only": True},
+        )
+        return PreparedRun(
+            program=self,
+            rows=rows,
+            resources=resources,
+            backend=selected_backend,
+        )
 
     def _reopt_root(self, sha: str) -> Path:
         """A workspace path for re-optimizing on reviewed logs.
@@ -453,4 +542,68 @@ class Program:
                 "target_model": model,
                 "parent": str(self._workspace.root),
             },
+        )
+
+
+class PreparedRun:
+    """A fixed-data run paused between proposal and implementation search."""
+
+    def __init__(self, *, program: Program, rows: list[dict], resources, backend):
+        self.program = program
+        self.rows = list(rows)
+        self.resources = resources
+        self.backend = backend
+
+    @property
+    def workspace(self):
+        return self.program.workspace
+
+    @property
+    def metric_proposal(self) -> dict | None:
+        if self.workspace is None:
+            return None
+        path = self.workspace.root / "metric_proposal.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+
+    def show_metric_suite(self) -> dict | None:
+        """Return and print the orchestrator's proposal for user review."""
+        proposal = self.metric_proposal
+        if proposal is None:
+            print("[autoprogramming] no metric proposal is recorded yet")
+        else:
+            print(json.dumps(proposal, indent=2))
+        return proposal
+
+    def demonstrate_metrics(self, examples: list[tuple]) -> list[dict]:
+        """Run every proposed lens on user-chosen predicted/expected pairs."""
+        if self.workspace is None:
+            raise WorkspaceError("The prepared run has no workspace.")
+        from .metric import demonstrate
+
+        rows = demonstrate(self.workspace, examples)
+        print(json.dumps(rows, indent=2, default=str))
+        return rows
+
+    def approve_metrics(self, approved_by: str, *, weights=None):
+        """Approve the recorded metric roles and precommitted policy."""
+        proposal = self.metric_proposal
+        if proposal is None:
+            raise WorkspaceError("There is no metric_proposal.json to approve.")
+        from .objectives import MetricSuite, approve_suite
+
+        suite = MetricSuite.from_dict(proposal["suite"])
+        approve_suite(self.workspace, approved_by, suite, weights=weights)
+        return self
+
+    def optimize(self, budget: Budget):
+        """Dispatch the portfolio against the already-fixed rows and workspace."""
+        return self.program.optimize(
+            self.rows,
+            budget,
+            workspace=self.workspace.root,
+            backend=self.backend,
+            resources=self.resources,
+            _context={"mode": "optimize"},
         )

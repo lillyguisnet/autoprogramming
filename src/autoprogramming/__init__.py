@@ -24,7 +24,11 @@ from .errors import (
     WorkspaceError,
 )
 from .harness import attach
-from .program import Program, program
+from .objectives import MetricSuite, SelectionPolicy, approve_suite
+from .pi_backend import PiOrchestratorBackend
+from .portfolio import ApproachTier, AvenueSpec, PortfolioPolicy
+from .program import PreparedRun, Program, program
+from .resources import DataPolicy, ResourceError, Resources, RuntimeResources, SearchResources
 
 try:
     __version__ = _dist_version("autoprogramming")
@@ -34,8 +38,21 @@ except PackageNotFoundError:
 __all__ = [
     "program",
     "Program",
+    "PreparedRun",
     "Budget",
     "attach",
+    "Resources",
+    "SearchResources",
+    "RuntimeResources",
+    "DataPolicy",
+    "ResourceError",
+    "MetricSuite",
+    "SelectionPolicy",
+    "approve_suite",
+    "ApproachTier",
+    "AvenueSpec",
+    "PortfolioPolicy",
+    "PiOrchestratorBackend",
     "AutoProgrammingError",
     "SchemaError",
     "DataDisciplineError",

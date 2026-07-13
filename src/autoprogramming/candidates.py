@@ -9,6 +9,8 @@ executes them — runner.py does that.
 
 from __future__ import annotations
 
+import hashlib
+import math
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -72,12 +74,34 @@ class Candidate:
     def cost_per_call(self) -> float | None:
         """``[tool.ap] cost_per_call`` as a float, or None when not declared."""
         value = self.tool_ap.get("cost_per_call")
-        return None if value is None else float(value)
+        if value is None:
+            return None
+        cost = float(value)
+        if not math.isfinite(cost) or cost < 0:
+            raise CandidateError(
+                f"[tool.ap] cost_per_call must be a finite non-negative dollar "
+                f"amount, got {value!r}."
+            )
+        return cost
 
     @property
     def fetch(self) -> tuple[str, ...]:
         """``[tool.ap] fetch`` entries (artifact download steps), possibly empty."""
         return tuple(self.tool_ap.get("fetch", ()))
+
+    @property
+    def artifact_namespace(self) -> str | None:
+        """Optional isolated subdirectory under the package's artifacts/."""
+        value = self.tool_ap.get("artifact_namespace")
+        if value is None:
+            return None
+        value = str(value)
+        if not value.replace("-", "_").isidentifier() or "/" in value or "\\" in value:
+            raise CandidateError(
+                f"Invalid [tool.ap] artifact_namespace {value!r}; use one simple "
+                "identifier-like directory name."
+            )
+        return value
 
 
 def parse_pep723(source: str) -> dict | None:
@@ -199,6 +223,27 @@ def new_candidate(workspace, source: str | None = None, from_: str | None = None
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(source, encoding="utf-8")
     return candidate
+
+
+def source_sha(candidate: Candidate) -> str:
+    """Stable identity of the implementation source alone."""
+    return hashlib.sha256(candidate.source.encode("utf-8")).hexdigest()
+
+
+def bundle_sha(workspace, candidate: Candidate) -> str:
+    """Identity of source plus the candidate's declared artifact namespace."""
+    digest = hashlib.sha256(candidate.source.encode("utf-8"))
+    namespace = getattr(candidate, "artifact_namespace", None)
+    if namespace:
+        root = Path(workspace.artifacts_dir) / namespace
+        if root.exists():
+            for path in sorted(p for p in root.rglob("*") if p.is_file()):
+                digest.update(path.relative_to(root).as_posix().encode())
+                digest.update(b"\0")
+                with path.open("rb") as fh:
+                    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def runtime_deps(candidate: Candidate, dist_name: str) -> tuple[str, ...]:

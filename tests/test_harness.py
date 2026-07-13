@@ -562,6 +562,64 @@ def test_propose_metric_multi_passes_primary(tmp_path, monkeypatch):
     assert json.loads(ws.metric_approval.read_text())["primary"] == "half"
 
 
+def test_diverse_finalists_take_one_per_portfolio_tier_first(tmp_path):
+    ws = make_workspace(tmp_path)
+    ws.portfolio_json.parent.mkdir(parents=True)
+    ws.portfolio_json.write_text(json.dumps({"avenues": [
+        {"spec": {"tier": 7}, "candidates": ["candidate_0", "candidate_1"]},
+        {"spec": {"tier": 6}, "candidates": ["candidate_2"]},
+        {"spec": {"tier": 3}, "candidates": ["candidate_3"]},
+    ]}))
+    assert harness._diverse_finalists(
+        ws,
+        ["candidate_0", "candidate_1", "candidate_2", "candidate_3"],
+        3,
+    ) == ["candidate_0", "candidate_2", "candidate_3"]
+
+
+def test_suite_finalize_promotes_entire_val_frontier_not_legacy_top_two(tmp_path):
+    from autoprogramming.objectives import MetricSuite, SelectionPolicy, approve_suite
+
+    ws = make_workspace(tmp_path)
+    metric_mod.write_metric(ws, (
+        "def graded(p, e):\n"
+        "    if p == e: return 1.0\n"
+        "    if str(p).rstrip('!') == str(e).rstrip('!'): return 0.7\n"
+        "    return 0.0\n"
+        "METRICS = {'graded': graded}\n"
+    ))
+    approve_suite(
+        ws, "tester",
+        MetricSuite(
+            acceptance=("graded",),
+            policy=SelectionPolicy(
+                preference_order=("graded",), max_test_finalists=3
+            ),
+        ),
+    )
+    h = harness.AgentHarness(ws)
+    sources = [
+        (0.30, 'return text.upper() + "!"'),
+        (0.10, 'return text.upper()'),
+        (0.00, 'return "wrong"'),
+    ]
+    for cost, body in sources:
+        h.new_candidate(source=(
+            "# /// script\n# [tool.ap]\n# deterministic = true\n"
+            f"# cost_per_call = {cost}\n# ///\n"
+            f"def predict(text):\n    {body}\n"
+        ))
+    for i in range(3):
+        h.eval(f"candidate_{i}", n_repeats=1)
+    assert set(h.tradeoffs().nondominated) == {
+        "candidate_0", "candidate_1", "candidate_2"
+    }
+    rep = h.finalize()
+    assert len(rep.entries) == 3
+    assert set(rep.frontier) == {"candidate_0", "candidate_1", "candidate_2"}
+    assert rep.activated == "candidate_0"
+
+
 def test_propose_metric_multi_table_shows_all_metrics(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("AP_AUTO_APPROVE_METRIC", raising=False)
     monkeypatch.setattr("sys.stdin", FakeTTY())

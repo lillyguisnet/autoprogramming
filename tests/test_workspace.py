@@ -195,7 +195,7 @@ def test_created_pyproject_is_valid_and_installable_shape(tmp_path):
     assert doc["tool"]["setuptools"]["packages"] == ["shout_ap"]
     assert doc["tool"]["setuptools"]["package-dir"] == {"shout_ap": "."}
     assert doc["tool"]["setuptools"]["package-data"]["shout_ap"] == [
-        "active.json", "candidates/*.py", "artifacts/*",
+        "active.json", "candidates/*.py", "artifacts/*", "artifacts/**/*",
     ]
 
 

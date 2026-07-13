@@ -135,6 +135,16 @@ def test_candidate_tool_ap_properties(tmp_path):
     assert cand.dependencies == ("transformers>=4.40",)
 
 
+def test_candidate_rejects_negative_or_nonfinite_cost():
+    for value in (-0.1, float("inf")):
+        candidate = Candidate(
+            name="candidate_0", path=Path("candidate_0.py"), source="",
+            tool_ap={"cost_per_call": value},
+        )
+        with pytest.raises(CandidateError, match="non-negative"):
+            _ = candidate.cost_per_call
+
+
 def test_candidate_uv_sources_parsed(tmp_path):
     ws = make_ws(tmp_path)
     write(ws, "candidate_0", README_STYLE)
