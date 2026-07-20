@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import IntEnum, StrEnum
 
 from .resources import Resources
@@ -45,6 +45,8 @@ class AvenueStatus(StrEnum):
     READY = "ready"
     EVALUATED = "evaluated"
     STAGNANT = "stagnant"
+    BLOCKED = "blocked"
+    NONCOMPLIANT = "noncompliant"
     INFEASIBLE = "infeasible"
     FAILED = "failed"
     CLOSED = "closed"
@@ -62,6 +64,10 @@ class AvenueSpec:
     mechanism: str
     runtime_requirements: tuple[str, ...] = ()
     allowed_api_providers: tuple[str, ...] = ()
+    required_capabilities: tuple[str, ...] = ()
+    required_mechanisms: tuple[str, ...] = ()
+    forbidden_substitutions: tuple[str, ...] = ()
+    allow_cross_tier_fallback: bool = False
     max_rounds: int = 3
     wildcard: bool = False
     compose_from: tuple[str, ...] = ()
@@ -70,7 +76,15 @@ class AvenueSpec:
         object.__setattr__(self, "tier", ApproachTier(int(self.tier)))
         object.__setattr__(self, "runtime_requirements", tuple(self.runtime_requirements))
         object.__setattr__(self, "allowed_api_providers", tuple(self.allowed_api_providers))
+        object.__setattr__(self, "required_capabilities", tuple(self.required_capabilities))
+        object.__setattr__(self, "required_mechanisms", tuple(self.required_mechanisms))
+        object.__setattr__(self, "forbidden_substitutions", tuple(self.forbidden_substitutions))
         object.__setattr__(self, "compose_from", tuple(self.compose_from))
+        if self.allow_cross_tier_fallback and self.tier != ApproachTier.COMPOSITION:
+            raise ValueError(
+                "Cross-tier fallback is reserved for an explicit composition avenue; "
+                f"{self.id!r} is tier {int(self.tier)}."
+            )
         if not self.id or not self.id.replace("-", "_").isidentifier():
             raise ValueError(f"Invalid avenue id {self.id!r}.")
         if not all((self.title.strip(), self.hypothesis.strip(), self.mechanism.strip())):
@@ -96,6 +110,8 @@ class AvenueSpec:
             for key in (
                 "id", "tier", "title", "hypothesis", "implementation_brief",
                 "mechanism", "runtime_requirements", "allowed_api_providers",
+                "required_capabilities", "required_mechanisms",
+                "forbidden_substitutions", "allow_cross_tier_fallback",
                 "max_rounds", "wildcard", "compose_from",
             )
             if key in value
@@ -113,6 +129,11 @@ class AvenueState:
     pending_candidate: str | None = None
     last_objectives: dict[str, float] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    compliance_attempts: int = 0
+    restart_count: int = 0
+    audits: list[dict] = field(default_factory=list)
+    blocker: dict | None = None
+    human_retry_confirmed: bool = False
 
     def begin_candidate(self, candidate: str) -> None:
         """Journal an imported candidate before evaluation starts."""
@@ -131,6 +152,44 @@ class AvenueState:
         if self.no_progress_rounds >= 2 or self.rounds >= self.spec.max_rounds:
             self.status = AvenueStatus.STAGNANT
 
+    def record_audit(self, audit: dict) -> None:
+        self.compliance_attempts += 1
+        self.audits.append(dict(audit))
+
+    def record_blocker(self, kind: str, details: list[str], *, candidate=None) -> None:
+        """Pause this avenue until a human chooses retry or confirmed exclusion."""
+        self.pending_candidate = None
+        self.status = AvenueStatus.BLOCKED
+        self.human_retry_confirmed = False
+        self.blocker = {
+            "kind": str(kind),
+            "details": [str(v) for v in details],
+            "candidate": candidate,
+            "human_confirmation_required": True,
+        }
+        self.notes.append(
+            f"blocked ({kind}); waiting for human confirmation before retry or exclusion"
+        )
+
+    def resolve_blocker(self, action: str, confirmed_by: str) -> None:
+        if self.status != AvenueStatus.BLOCKED or self.blocker is None:
+            raise ValueError(f"Avenue {self.spec.id!r} has no unresolved blocker.")
+        if action not in ("retry", "exclude"):
+            raise ValueError("Blocker action must be 'retry' or 'exclude'.")
+        if not str(confirmed_by).strip():
+            raise ValueError("confirmed_by must identify the human who made the decision.")
+        resolution = {
+            "action": action,
+            "confirmed_by": str(confirmed_by),
+            "blocker": self.blocker,
+        }
+        self.notes.append(f"human blocker resolution: {json.dumps(resolution, sort_keys=True)}")
+        self.blocker = None
+        self.human_retry_confirmed = action == "retry"
+        self.status = (
+            AvenueStatus.PLANNED if action == "retry" else AvenueStatus.INFEASIBLE
+        )
+
     @classmethod
     def from_dict(cls, value: dict) -> "AvenueState":
         return cls(
@@ -148,6 +207,11 @@ class AvenueState:
                 str(k): float(v) for k, v in value.get("last_objectives", {}).items()
             },
             notes=list(value.get("notes", [])),
+            compliance_attempts=int(value.get("compliance_attempts", 0)),
+            restart_count=int(value.get("restart_count", 0)),
+            audits=[dict(v) for v in value.get("audits", [])],
+            blocker=(dict(value["blocker"]) if value.get("blocker") else None),
+            human_retry_confirmed=bool(value.get("human_retry_confirmed", False)),
         )
 
     def to_dict(self) -> dict:
@@ -160,6 +224,11 @@ class AvenueState:
             "pending_candidate": self.pending_candidate,
             "last_objectives": dict(self.last_objectives),
             "notes": list(self.notes),
+            "compliance_attempts": self.compliance_attempts,
+            "restart_count": self.restart_count,
+            "audits": [dict(v) for v in self.audits],
+            "blocker": self.blocker,
+            "human_retry_confirmed": self.human_retry_confirmed,
         }
 
 
@@ -231,6 +300,7 @@ class Portfolio:
                     mechanism="task-specific wildcard mechanism unlike the planned families",
                     wildcard=True,
                 ))
+        specs = [ensure_avenue_contract(spec, resources) for spec in specs]
         result = cls(
             resources=resources,
             avenues=[AvenueState(spec=s) for s in specs],
@@ -289,10 +359,17 @@ class Portfolio:
     def breadth_complete(self) -> bool:
         if any(avenue.pending_candidate for avenue in self.avenues):
             return False
+        if any(
+            avenue.status == AvenueStatus.BLOCKED and avenue.blocker is not None
+            for avenue in self.avenues
+        ):
+            return False
         represented = {
             int(a.spec.tier)
             for a in self.avenues
-            if a.status not in (AvenueStatus.PLANNED, AvenueStatus.RUNNING)
+            if a.status not in (
+                AvenueStatus.PLANNED, AvenueStatus.RUNNING, AvenueStatus.BLOCKED
+            )
         }
         return all(
             not info["feasible"] or tier > 7 or tier in represented
@@ -308,11 +385,26 @@ class Portfolio:
         if self.policy.require_wildcard:
             wildcards = [a for a in self.avenues if a.spec.wildcard]
             if not wildcards or not any(
-                a.status not in (AvenueStatus.PLANNED, AvenueStatus.RUNNING)
+                a.status not in (
+                    AvenueStatus.PLANNED, AvenueStatus.RUNNING, AvenueStatus.BLOCKED
+                )
                 for a in wildcards
             ):
                 return False
         return any(a.status in (AvenueStatus.EVALUATED, AvenueStatus.STAGNANT) for a in self.avenues)
+
+    @property
+    def unresolved_blockers(self) -> list[AvenueState]:
+        return [
+            avenue for avenue in self.avenues
+            if avenue.status == AvenueStatus.BLOCKED and avenue.blocker is not None
+        ]
+
+    def resolve_blocker(self, avenue_id: str, action: str, confirmed_by: str) -> None:
+        matches = [a for a in self.avenues if a.spec.id == avenue_id]
+        if not matches:
+            raise ValueError(f"Unknown portfolio avenue {avenue_id!r}.")
+        matches[0].resolve_blocker(action, confirmed_by)
 
     def to_dict(self) -> dict:
         return {
@@ -381,13 +473,101 @@ _DEFAULTS = {
 }
 
 
+def ensure_avenue_contract(spec: AvenueSpec, resources: Resources) -> AvenueSpec:
+    """Fill omitted machine-readable constraints from the tier contract.
+
+    Pi may make the prose task-specific, but it cannot weaken the controller's
+    default mechanism boundary by omitting contract fields from its JSON plan.
+    """
+    default = default_avenue(spec.tier, resources)
+    permitted = tuple(
+        provider for provider in spec.allowed_api_providers
+        if provider in set(default.allowed_api_providers)
+    )
+    return replace(
+        spec,
+        allowed_api_providers=(permitted or default.allowed_api_providers),
+        required_capabilities=tuple(dict.fromkeys(
+            (*default.required_capabilities, *spec.required_capabilities)
+        )),
+        required_mechanisms=tuple(dict.fromkeys(
+            (*default.required_mechanisms, *spec.required_mechanisms)
+        )),
+        forbidden_substitutions=tuple(dict.fromkeys(
+            (*default.forbidden_substitutions, *spec.forbidden_substitutions)
+        )),
+        allow_cross_tier_fallback=(spec.tier == ApproachTier.COMPOSITION),
+    )
+
+
 def default_avenue(tier: ApproachTier, resources: Resources) -> AvenueSpec:
     avenue_id, title, hypothesis, brief, mechanism = _DEFAULTS[tier]
-    providers = resources.runtime.api_providers if tier in (
+    providers = tuple(
+        provider for provider in resources.runtime.api_providers
+        if provider in set(resources.search.candidate_api_providers or ())
+    ) if tier in (
         ApproachTier.GENERALIST_AGENT,
         ApproachTier.MODEL_GRAPH,
         ApproachTier.SINGLE_MODEL_CALL,
     ) else ()
+    contract = {
+        ApproachTier.GENERALIST_AGENT: {
+            "required_mechanisms": ("a live runtime tool-using reasoning agent",),
+            "forbidden_substitutions": (
+                "classical ML fallback", "rules fallback", "lookup fallback",
+            ),
+            "required_capabilities": tuple(
+                f"candidate-api:{provider}" for provider in providers
+            ),
+        },
+        ApproachTier.MODEL_GRAPH: {
+            "required_mechanisms": ("multiple live model calls with explicit stages",),
+            "forbidden_substitutions": (
+                "single-call substitute", "classical ML fallback", "rules fallback",
+            ),
+            "required_capabilities": tuple(
+                f"candidate-api:{provider}" for provider in providers
+            ),
+        },
+        ApproachTier.SINGLE_MODEL_CALL: {
+            "required_mechanisms": ("one live model-provider call",),
+            "forbidden_substitutions": (
+                "classical ML fallback", "rules fallback", "lookup fallback",
+            ),
+            "required_capabilities": tuple(
+                f"candidate-api:{provider}" for provider in providers
+            ),
+        },
+        ApproachTier.FINETUNED_MODEL: {
+            "required_mechanisms": ("inference through the assigned fine-tuned model",),
+            "forbidden_substitutions": (
+                "base-model substitute", "classical ML fallback", "rules fallback",
+            ),
+            "required_capabilities": ("fine-tuning",),
+        },
+        ApproachTier.SPECIALIZED_DEEP_MODEL: {
+            "required_mechanisms": ("inference through a task-specialized deep model",),
+            "forbidden_substitutions": (
+                "classical ML fallback", "classical CV fallback", "rules fallback",
+            ),
+            "required_capabilities": ("package-installs", "model-downloads"),
+        },
+        ApproachTier.CLASSICAL_ML: {
+            "required_mechanisms": ("a fitted classical estimator or learned classical features",),
+            "forbidden_substitutions": ("model API substitute", "deep-model substitute"),
+            "required_capabilities": ("package-installs",),
+        },
+        ApproachTier.CODE_AND_RULES: {
+            "required_mechanisms": ("a direct generalized algorithm, feature, or rule system",),
+            "forbidden_substitutions": ("model API substitute", "deep-model substitute"),
+            "required_capabilities": (),
+        },
+        ApproachTier.COMPOSITION: {
+            "required_mechanisms": ("an explicit bounded composition of the listed components",),
+            "forbidden_substitutions": (),
+            "required_capabilities": (),
+        },
+    }[tier]
     return AvenueSpec(
         id=avenue_id,
         tier=tier,
@@ -396,4 +576,8 @@ def default_avenue(tier: ApproachTier, resources: Resources) -> AvenueSpec:
         implementation_brief=brief,
         mechanism=mechanism,
         allowed_api_providers=providers,
+        required_capabilities=contract["required_capabilities"],
+        required_mechanisms=contract["required_mechanisms"],
+        forbidden_substitutions=contract["forbidden_substitutions"],
+        allow_cross_tier_fallback=(tier == ApproachTier.COMPOSITION),
     )

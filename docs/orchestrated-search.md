@@ -19,6 +19,7 @@ controller-enforced breadth policy.
 | User | resource proposal, metric demonstrations, final report | hidden rows |
 | Python controller | all run state, expected outputs, metrics, budget | n/a |
 | Pi orchestrator | schema, confirmed resources, portfolio state, aggregate vectors | hidden rows; implementation tools |
+| Pi mechanism auditor | one avenue contract and its proposed source/dependency metadata | examples, metrics, scores, other candidates, val/test |
 | Pi implementation worker | generic task brief, development examples, its own files and assigned mechanism | optimizer identity, metrics, scores, other workers, parent workspace, val/test |
 | Candidate runtime | one input at a time, schema/runtime artifacts | expected val/test outputs |
 
@@ -39,8 +40,10 @@ sandboxing.
    shipped package.
 3. `DataPolicy`: whether task data may leave the machine and to which domains.
 
-Hardware may be detected. Egress, network, downloads, and package installation
-are never inferred as consent. If egress is forbidden, Pi must be explicitly
+Hardware may be detected. Egress, network, downloads, package installation, and
+candidate-evaluation API access are never inferred as consent. Runtime API
+permission and usable search-time provider access are separate facts. If egress
+is forbidden, Pi must be explicitly
 confirmed local because worker tool results include task context and examples in
 model requests. Profiles contain provider names and capability limits, never
 credentials.
@@ -67,6 +70,14 @@ The controller tracks eight tiers:
 8. cross-tier composition
 
 Every feasible tier must be attempted or carry an explicit infeasibility reason.
+Each avenue is a hard mechanism experiment: workers may not replace a blocked
+API/deep/classical/rules mechanism with another family merely to return a valid
+answer. Dependencies are resolved from PEP 723 rather than inferred from the
+worker's current environment. Before candidate import, deterministic source
+checks and an independent Pi mechanism audit reject cross-tier fallbacks; the
+controller requests bounded in-session repairs and then clean-session restarts.
+Rejected source is never evaluated under that avenue.
+
 Default budget allocation is 40% breadth, 40% deepening, and 20%
 composition/wildcards. A family receives two materially different engineering
 passes before it is abandoned unless it hard-fails. After breadth, the main Pi
@@ -113,8 +124,8 @@ trusted portfolio controller.
 
 Python uses Pi's documented process APIs:
 
-- one strategy-only `--mode rpc` orchestrator with no built-in tools or discovered
-  project resources;
+- strategy-only `--mode rpc` calls with no built-in tools or discovered project
+  resources, including independent source-vs-mechanism adherence reviews;
 - parallel `--mode json --print` implementation workers with skills, context,
   prompts, themes, and user extensions disabled;
 - an explicitly loaded root-guard extension;
@@ -153,6 +164,16 @@ candidate rather than dispatching a duplicate. Orphan artifact namespaces from
 a crash before candidate creation are replaced only when no candidate file can
 reference them.
 
+## Human confirmation for blocked approaches
+
+A preflight failure or an all-run environmental failure marks an avenue
+`blocked`, which does not satisfy portfolio breadth. The controller pauses and
+shows the missing capability instead of accepting fallback code or silently
+excluding the family. A human may fix/provision it and choose `retry`, or may
+explicitly confirm `exclude`, via `prg.resolve_blocker(...)`. The decision and
+approver are persisted in portfolio state. A retry bypasses one stale preflight
+snapshot so newly provisioned hardware/access can be exercised.
+
 ## User flow
 
 ```python
@@ -160,6 +181,7 @@ resources = ap.Resources(
     search=ap.SearchResources(
         max_parallel_agents=4,
         pi_local=True,  # or permit external egress for a remote Pi provider
+        candidate_api_providers=("openai",),  # usable during candidate evaluation
         allow_package_installs=True,
         allow_model_downloads=True,
     ),

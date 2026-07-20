@@ -126,6 +126,36 @@ def test_portfolio_state_round_trips_for_resume(tmp_path):
     assert loaded_state.last_objectives == {"quality": 0.75}
 
 
+def test_blocked_avenue_needs_human_resolution_before_breadth(tmp_path):
+    portfolio = Portfolio.create(resources(), [spec()])
+    state = next(a for a in portfolio.avenues if a.spec.id == "custom-rules")
+    for avenue in portfolio.avenues:
+        avenue.status = AvenueStatus.FAILED
+    state.record_blocker("environment-preflight", ["GPU unavailable"])
+    assert portfolio.breadth_complete is False
+    assert portfolio.may_finalize is False
+    assert portfolio.unresolved_blockers == [state]
+
+    path = tmp_path / "portfolio.json"
+    portfolio.write(path)
+    loaded = Portfolio.load(path)
+    loaded.resolve_blocker("custom-rules", "retry", "human")
+    retried = next(a for a in loaded.avenues if a.spec.id == "custom-rules")
+    assert retried.status == AvenueStatus.PLANNED
+    assert retried.blocker is None
+    assert retried.human_retry_confirmed is True
+
+
+def test_human_can_confirm_blocked_approach_is_really_unavailable():
+    portfolio = Portfolio.create(resources(), [spec()])
+    state = next(a for a in portfolio.avenues if a.spec.id == "custom-rules")
+    state.record_blocker("candidate-environment-failure", ["credential missing"])
+    portfolio.resolve_blocker("custom-rules", "exclude", "human-user")
+    assert state.status == AvenueStatus.INFEASIBLE
+    assert state.blocker is None
+    assert "human-user" in state.notes[-1]
+
+
 def test_public_exports():
     assert ap.ApproachTier is ApproachTier
     assert ap.AvenueSpec is AvenueSpec

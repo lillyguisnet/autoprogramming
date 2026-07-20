@@ -22,6 +22,15 @@ and cross-tier composition round. Metric suites separate user-approved
 acceptance lenses from search-only diagnostics; approach novelty is a portfolio
 gate, not a quality metric.
 
+An avenue is a **hard mechanism experiment**, not a request to solve the task by
+any means. It may fail, block, or score badly, but it must never switch families
+to avoid an error. No API key means the API avenue reports a setup blocker; it
+does not become classical ML. Missing Torch/GPU means the deep-model avenue
+fails clearly; it does not become classical CV. Dependencies belong in PEP 723
+and need not be globally installed. The controller audits mechanism adherence
+before import, repairs violations in-session, and clean-restarts persistent
+violators. Only explicit composition avenues may route across families.
+
 You are optimizing one typed program by writing, evaluating, and evolving
 complete candidate implementations — plain Python files — under a strict data
 discipline and an explicit budget. Your job is not to polish one idea; it is to
@@ -72,6 +81,7 @@ Read per-workspace facts live from the workspace, not from memory:
     prg.compare("candidate_0", "candidate_1", objective="cost_dollars")  # any objective
     prg.tradeoffs()                              # the quality/cost Pareto frontier
     prg.frontier()                               # Pareto frontier over train rows
+    prg.resolve_blocker(id, "retry", confirmed_by="user")  # after human check
     prg.finalize()                               # suite policy chooses finalists — LAST
 
 ## Survey the approach ladder before you commit
@@ -106,6 +116,10 @@ Rules to follow, not options:
   after a fair attempt — the right variant, sane pre/post-processing, and at least
   two configs. A single failed config is not a dead family. Record WHY a path was
   dropped as a scored result (`prg.eval` / `prg.compare` output), not a hunch.
+  If the whole family appears blocked by credentials, GPU, packages, downloads,
+  or network, pause and check with the human: they may be able to fix it. Retry
+  with `prg.resolve_blocker(id, "retry", confirmed_by="user")`; exclude only
+  after the human explicitly confirms the capability is unavailable.
 - **Pick the cheapest tier that can plausibly clear the bar**, then climb only when
   the data shows that tier's ceiling. Cost is an objective, not an afterthought
   (see below): a rules candidate at 0.95 beats a model call at 0.90 when the CI
@@ -203,6 +217,11 @@ per known cost, not perfection at any price.
   dependencies can coexist — each runs in its own environment.
 - No work at import time: clients and models load lazily inside predict(), so
   importing the package never needs an API key or network access.
+- **Never add a cross-family safety fallback.** Provider/model retries and robust
+  parsing are valid; `if no key: use sklearn`, `except ImportError: use cv2`, or
+  `if no GPU: use rules` are invalid. Raise a precise setup error instead. A
+  faithful zero-scoring failure teaches the portfolio that the mechanism is
+  blocked; a high-scoring substitute corrupts the experiment.
 - A candidate that makes no stochastic calls should declare `[tool.ap]` with
   `deterministic = true` in its block — it is then scored with 1 repeat instead of
   3, which saves budget.

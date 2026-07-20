@@ -351,6 +351,27 @@ class AgentHarness:
 
         return metric_suite(self._workspace)
 
+    def resolve_blocker(
+        self, avenue_id: str, action: str, *, confirmed_by: str
+    ) -> None:
+        """Resolve an environment-blocked approach after checking with a human.
+
+        ``action='retry'`` means the capability was fixed (or the human wants it
+        attempted again). ``action='exclude'`` confirms that this approach really
+        is unavailable. The controller never makes that exclusion on a worker's
+        word alone and never substitutes another mechanism under the avenue.
+        """
+        path = self._workspace.portfolio_json
+        if not path.exists():
+            raise NotOptimizedError(
+                "There is no Pi portfolio state with an approach blocker to resolve."
+            )
+        from .portfolio import Portfolio
+
+        portfolio = Portfolio.load(path)
+        portfolio.resolve_blocker(avenue_id, action, confirmed_by)
+        portfolio.write(path)
+
     def finalize(self, top_k: int | None = None) -> FinalReport:
         """The one-time test evaluation: score the top val candidates on test,
         demote overfitters, activate the winner, and seal the workspace.

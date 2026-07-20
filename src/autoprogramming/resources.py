@@ -54,7 +54,13 @@ class DataPolicy:
 
 @dataclass(frozen=True)
 class SearchResources:
-    """Resources available while candidates are researched and built."""
+    """Resources available while candidates are researched and built.
+
+    ``candidate_api_providers`` is tri-state: ``None`` is unanswered, ``()``
+    confirms that no provider access exists, and names identify providers whose
+    authentication/access is usable by candidate evaluation. It records
+    capabilities only, never credential values.
+    """
 
     cpu_cores: int | None = None
     memory_gb: float | None = None
@@ -68,7 +74,7 @@ class SearchResources:
     fine_tuning: bool = False
     pi_models: tuple[str, ...] = ()
     pi_local: bool = False
-    candidate_api_providers: tuple[str, ...] = ()
+    candidate_api_providers: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         _positive("search.cpu_cores", self.cpu_cores)
@@ -81,9 +87,10 @@ class SearchResources:
             self.max_dollars_per_agent_call,
         )
         object.__setattr__(self, "pi_models", _tuple(self.pi_models))
-        object.__setattr__(
-            self, "candidate_api_providers", _tuple(self.candidate_api_providers)
-        )
+        if self.candidate_api_providers is not None:
+            object.__setattr__(
+                self, "candidate_api_providers", _tuple(self.candidate_api_providers)
+            )
 
     @classmethod
     def detect(cls) -> "SearchResources":
@@ -190,6 +197,11 @@ class Resources:
             questions.append("May workers install third-party Python packages?")
         if self.search.allow_model_downloads is None:
             questions.append("May workers download pretrained model artifacts?")
+        if self.runtime.api_providers and self.search.candidate_api_providers is None:
+            questions.append(
+                "Which runtime API providers are actually available to candidate "
+                "evaluations during this search (credentials/access, not secret values)?"
+            )
         if not self.confirmed:
             questions.append("Confirm this search and deployment resource profile.")
         return tuple(questions)
@@ -223,7 +235,10 @@ class Resources:
     def feasibility(self) -> dict[int, dict[str, str | bool]]:
         """Feasibility of the approach ladder under this runtime contract."""
         runtime_network = self.runtime.network is True and not self.runtime.offline
-        APIs = bool(self.runtime.api_providers)
+        runtime_apis = set(self.runtime.api_providers)
+        search_apis = set(self.search.candidate_api_providers or ())
+        usable_apis = runtime_apis & search_apis
+        APIs = bool(usable_apis)
         can_externalize = self.data.external_egress is True
         install = self.search.allow_package_installs is True
         download = self.search.allow_model_downloads is True
@@ -238,11 +253,13 @@ class Resources:
             ),
             2: item(
                 runtime_network and APIs and can_externalize,
-                "requires runtime model APIs and permitted data egress",
+                "requires a runtime-permitted model API that is also confirmed "
+                "available to candidate evaluation, plus permitted data egress",
             ),
             3: item(
                 runtime_network and APIs and can_externalize,
-                "requires a runtime model API and permitted data egress",
+                "requires a runtime-permitted model API that is also confirmed "
+                "available to candidate evaluation, plus permitted data egress",
             ),
             4: item(
                 self.search.fine_tuning

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Made portfolio avenues hard mechanism contracts: implementation workers may
+  not replace a blocked API, deep-model, classical, or rules approach with
+  another family merely to avoid an error.
+- Added deterministic and independent Pi mechanism-adherence audits before
+  candidate import, with bounded in-session repair and clean-session restart.
+- Added search-time candidate API access to the confirmed resource contract.
+- Added environment blocker state and human-confirmed retry/exclusion; blocked
+  approaches pause breadth instead of silently falling back or being discarded.
+
 ## 0.2.0 — 2026-07-12
 
 - Added a resource-aware Pi portfolio backend with one strategy orchestrator and

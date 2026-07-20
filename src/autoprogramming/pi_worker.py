@@ -16,18 +16,33 @@ from .resources import Resources
 
 
 WORKER_SYSTEM = """You are the sole implementation engineer for a standalone
-Python function. Focus only on making this implementation as strong, robust, and
-resource-efficient as possible using the assigned strategy. You have no broader
-coordination duties. Work only in the provided directory. Read task.md and
-examples.jsonl, then create solution.py defining predict with exactly the input
-parameters in task.md. solution.py may contain one valid PEP 723 script block for
-dependencies. Do not hard-code or copy example outputs into a lookup table. Load
-clients and models lazily. If files are needed at runtime, put them under the
-artifact namespace named in task.md and declare that same directory as
-`artifact_namespace` under `[tool.ap]`; resolve it as
+Python function. Your first and non-negotiable obligation is MECHANISM FIDELITY:
+implement exactly the approach contract in task.md and push that particular
+mechanism as far as possible. Returning a plausible answer through a different
+approach is a failure, even if it avoids an exception or appears more reliable.
+
+NEVER replace the assigned mechanism because a package, model, API credential,
+GPU, network service, or other capability is missing in your authoring shell.
+Third-party packages need not already be installed: declare them in the PEP 723
+block so the execution controller can resolve them. If an assigned capability
+really cannot be exercised locally, still implement it faithfully, syntax-check
+what you can, and make the runtime fail clearly with a precise setup error. Do
+not add classical ML, classical CV, rules, regex, lookup, local-model, or API
+fallbacks from another approach family. Retries, parsing, preprocessing, and
+error handling are welcome only when the assigned mechanism remains the path
+that produces the answer. Cross-family routing is allowed solely when task.md
+explicitly identifies this as a composition contract.
+
+You have no broader coordination duties. Work only in the provided directory.
+Read task.md and examples.jsonl, then create solution.py defining predict with
+exactly the input parameters in task.md. solution.py may contain one valid PEP
+723 script block for dependencies. Do not hard-code or copy example outputs into
+a lookup table. Load clients and models lazily. If files are needed at runtime,
+put them under the artifact namespace named in task.md and declare that same
+directory as `artifact_namespace` under `[tool.ap]`; resolve it as
 `Path(__file__).parents[1] / "artifacts" / <namespace>`. If a call spends money,
-report AP_COST_DOLLARS after each prediction. Finish only after syntax-checking
-solution.py.
+report AP_COST_DOLLARS after each prediction. Finish only after checking that no
+error branch substitutes a different mechanism and syntax-checking solution.py.
 """
 
 
@@ -245,6 +260,16 @@ def task_document(schema, spec: AvenueSpec, resources: Resources) -> str:
         f"- `{field.name}: {field.type_name}` — {field.description}"
         for field in schema.outputs
     )
+    search_resources = {
+        key: getattr(resources.search, key)
+        for key in (
+            "cpu_cores", "memory_gb", "disk_gb", "gpu", "gpu_vram_gb",
+            "allow_package_installs", "allow_model_downloads", "fine_tuning",
+        )
+    }
+    search_resources["available_runtime_api_access"] = (
+        resources.search.candidate_api_providers
+    )
     return f"""# Implementation task
 
 ## Goal
@@ -260,11 +285,24 @@ def task_document(schema, spec: AvenueSpec, resources: Resources) -> str:
 For one output, return its value. For several outputs, return a tuple in the
 order above or a dict keyed by output name.
 
-## Assigned strategy
+## Non-negotiable approach contract
 {spec.title}: {spec.implementation_brief}
 
 Hypothesis: {spec.hypothesis}
-Mechanism boundary: {spec.mechanism}
+Required mechanism boundary: {spec.mechanism}
+Required mechanism evidence: {list(spec.required_mechanisms)}
+Forbidden substitutions: {list(spec.forbidden_substitutions)}
+Cross-tier fallback permitted: {spec.allow_cross_tier_fallback}
+
+The implementation is invalid if another family produces the answer when this
+mechanism is unavailable. Missing dependencies or capabilities must cause a
+clear setup/runtime failure, never a substitute implementation.
+
+## Available build/search resources
+{json.dumps(search_resources, default=str, indent=2)}
+
+Packages declared in solution.py's PEP 723 block are resolved by the execution
+controller. Their absence from the current shell is not a reason to avoid them.
 
 ## Permitted runtime resources
 {json.dumps(resources.runtime.__dict__, default=str, indent=2)}

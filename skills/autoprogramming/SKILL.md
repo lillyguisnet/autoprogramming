@@ -69,8 +69,10 @@ the optimizer figure out.
    val selection; diagnostic lenses may evolve and re-score cached outputs.
 5. **What resources exist while SEARCHING?** CPU/RAM/disk, GPU + VRAM,
    package/model-download permission, fine-tuning services, permitted Pi models,
-   maximum parallel workers, and a conservative maximum dollars per agent call
-   if parallel Pi spend should be reserved rather than serialized.
+   **which candidate API providers actually have usable evaluation-time access**
+   (capability names only, never secret values), maximum parallel workers, and a
+   conservative maximum dollars per agent call if parallel Pi spend should be
+   reserved rather than serialized.
 6. **What may the SHIPPED PROGRAM require?** Runtime CPU/GPU/RAM/network,
    candidate API providers, latency/cost/artifact limits, and whether task data
    may leave the machine. Search and runtime resources are different contracts.
@@ -133,6 +135,7 @@ resources = ap.Resources(
     search=ap.SearchResources(max_parallel_agents=4,
                               max_dollars_per_agent_call=0.05,
                               pi_local=True,  # egress is false below
+                              candidate_api_providers=(),  # no candidate API access in this offline profile
                               allow_package_installs=True,
                               allow_model_downloads=True),
     runtime=ap.RuntimeResources(network=False),
@@ -152,6 +155,15 @@ breadth and dispatches parallel, implementation-only Pi workers. Those workers
 must never receive optimizer identity, metric names/code/weights, leaderboard
 scores, other workers, val, or test. They see a generic function task, dev-fit
 examples, one assigned mechanism, permitted resources, and their own prior files.
+
+**Mechanism fidelity is absolute.** An avenue may fail, be blocked, or score
+poorly, but it may never substitute another approach family to keep the function
+working. Missing Torch, a model, an API key, GPU, network, or package is a setup
+failure—not permission to replace a deep/API avenue with classical CV, rules, or
+a lookup. Workers must declare dependencies in PEP 723 and fail clearly when a
+required capability is truly unavailable. Before import, the controller performs
+deterministic plus independent semantic adherence checks; rejected source is
+repaired in-session and then clean-restarted, never scored as that avenue.
 
 What happens mechanically:
 
@@ -193,8 +205,13 @@ What happens mechanically:
   untouchable until `finalize()` evaluates it once, at the end, on the top
   candidates, and activates the winner. See
   [references/prg-api.md](references/prg-api.md) for the full loop.
+- If an approach completely fails because infrastructure appears unavailable,
+  the controller pauses instead of accepting a fallback or discarding the tier.
+  Ask the human whether they can fix it. After they do, use
+  `prg.resolve_blocker("<avenue>", "retry", confirmed_by="user")`; only after
+  explicit human agreement may you use `"exclude"`. Then resume `optimize()`.
 - Returns a `FinalReport` when candidates were scored; `None` when the
-  workspace is awaiting a manual session.
+  workspace is awaiting metric approval, blocker resolution, or a manual session.
 
 Afterwards the program is a normal function and a normal package:
 

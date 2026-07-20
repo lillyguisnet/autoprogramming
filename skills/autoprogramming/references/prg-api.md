@@ -307,6 +307,27 @@ candidates no other candidate dominates (>= on every shared row, > on one);
 `split="train", per_instance=True` to include them). Complementary candidates
 that win different rows are prime material for a merged/pipeline candidate.
 
+## Resolve an environment blocker: `resolve_blocker`
+
+```py
+prg.resolve_blocker(avenue_id, action, confirmed_by="user")
+```
+
+When every run of a faithful approach fails for an environmental reason (missing
+API access, package, model, GPU, network, etc.), or controller preflight finds a
+required capability absent, the portfolio pauses. It does **not** accept a
+cross-family fallback and does not silently discard the approach. Check with the
+human first: they may be able to install/provision/fix it.
+
+- `action="retry"` — the human fixed the capability or explicitly requests
+  another attempt. This grants one retry even when conservative preflight still
+  reflects the old environment snapshot.
+- `action="exclude"` — only after the human confirms the approach really is
+  unavailable. The avenue becomes an explicit infeasibility, not a fake result.
+- `confirmed_by` is required so the controller records who made the decision.
+
+Then resume the original `optimize()` call with a new explicit budget.
+
 ## Finish: `finalize`
 
 ```py
@@ -363,6 +384,7 @@ set. Do not skip finalize either: an un-finalized workspace ships nothing.
 | Scoring with unapproved / changed metric | `MetricNotApprovedError` / `MetricChangedError` |
 | 6th distinct candidate on val in bootstrap mode (< 30 examples) | `BootstrapModeError`, raised before any spend |
 | Any charge once a limit is hit | `BudgetExceededError` (finalize still runs) |
+| Environment-blocked avenue | Portfolio pauses for human `retry` / confirmed `exclude`; no fallback is accepted |
 | Second `finalize()` | `FinalizedError` |
 
 Soft signals (warnings, not errors):

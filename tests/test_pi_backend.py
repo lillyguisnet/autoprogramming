@@ -296,6 +296,10 @@ def test_worker_brief_contains_no_optimizer_or_metric_context():
     hidden_terms = ("autoprogramming", "prg.", "metric", "leaderboard", "candidate_")
     combined = (_WORKER_SYSTEM + brief).lower()
     assert all(term not in combined for term in hidden_terms)
+    assert "non-negotiable approach contract" in combined
+    assert "never replace the assigned mechanism" in combined
+    assert "pep 723" in combined
+    assert "max_parallel_agents" not in combined  # does not reveal other workers
 
 
 def test_json_extractor_accepts_plain_and_fenced():

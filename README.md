@@ -56,7 +56,7 @@ translate("Hello, how are you?")
 
 ## Orchestrated portfolio search with Pi
 
-The main Pi agent is a strategy orchestrator, not a candidate author. It plans a resource-feasible portfolio across runtime agents, model graphs, single calls, fine-tunes, specialized models, classical ML, and direct code/rules. A trusted Python controller then launches isolated Pi implementation workers in parallel, one avenue each. Workers receive a generic function contract, development examples, their assigned mechanism, and their own files—never optimizer context, metric code or weights, scores, other workers, val, or test.
+The main Pi agent is a strategy orchestrator, not a candidate author. It plans a resource-feasible portfolio across runtime agents, model graphs, single calls, fine-tunes, specialized models, classical ML, and direct code/rules. A trusted Python controller then launches isolated Pi implementation workers in parallel, one avenue each. Workers receive a generic function contract, development examples, their assigned mechanism, and their own files—never optimizer context, metric code or weights, scores, other workers, val, or test. The mechanism is a hard contract: an API worker may not become classical ML when a key is missing, and a deep-model worker may not become classical CV when Torch/GPU is unavailable. The controller audits source before import, repairs or clean-restarts violations, and never scores a cross-tier substitute under the requested avenue.
 
 Search is breadth-first by policy, not merely by prompt: every feasible family must be attempted or explicitly excluded, each successful family gets a second engineering pass, and only then does the orchestrator allocate deeper rounds and cross-tier composition. See [`docs/orchestrated-search.md`](docs/orchestrated-search.md).
 
@@ -68,6 +68,7 @@ resources = ap.Resources(
         max_parallel_agents=4,
         max_dollars_per_agent_call=0.05,  # reserves in-flight budget headroom
         pi_local=True,  # required here because external_egress=False below
+        candidate_api_providers=("openai",),  # usable during candidate evaluation
         allow_package_installs=True,
         allow_model_downloads=True,
     ),
@@ -92,6 +93,8 @@ report = prepared.optimize(ap.Budget(dollars=20))
 Hardware can be detected, but AutoProgramming never interprets an API key, network connection, or installed GPU as permission to send data or require that resource in production. Resource profiles store capabilities and provider names, never secrets. Under a dollar budget, Pi calls are serialized unless `max_dollars_per_agent_call` is confirmed; with that bound, each parallel call reserves headroom and settles its actual reported cost before more work launches. For unattended runs, pass an explicit `PiOrchestratorBackend(orchestrator_model=..., worker_model=..., orchestrator_timeout=..., worker_timeout=...)` to avoid inheriting an unexpectedly slow global Pi model/thinking configuration.
 
 Metric suites distinguish **acceptance lenses** (user-approved and eligible to choose the final program) from **diagnostic lenses** (orchestrator-managed search feedback). Suite-aware search uses acceptance floors and a Pareto frontier rather than requiring one weighted scalar. The legacy primary remains a report headline for older workspaces.
+
+If an approach completely fails because API access, GPU, packages, models, or network appear unavailable, the controller pauses for human confirmation instead of silently dropping it. The user can fix the capability and request a retry, or explicitly confirm exclusion with `prg.resolve_blocker(...)`; fallback code is never the answer.
 
 ## Data discipline
 

@@ -921,8 +921,15 @@ def evaluate(
                 )
                 reps_list.append(_run_cache_entry(run))
                 if not run.ok:
-                    first = (getattr(run, "error", None) or "candidate failed").strip().splitlines()[0]
-                    run_errors.append(f"{row_id} repeat {rep}: {first}")
+                    lines = (
+                        getattr(run, "error", None) or "candidate failed"
+                    ).strip().splitlines()
+                    # The final traceback line carries the actionable exception
+                    # (missing credential/module/CUDA, etc.); preserving it lets
+                    # the portfolio distinguish an environmental blocker from a
+                    # bad prediction and ask a human before excluding the avenue.
+                    summary = lines[-1] if lines else "candidate failed"
+                    run_errors.append(f"{row_id} repeat {rep}: {summary}")
             cache_rows[row_id] = reps_list
 
     sub = _aggregate_from_cache(

@@ -366,7 +366,7 @@ def test_failed_run_scores_zero_and_records_error(ws, monkeypatch):
     install_fakes(monkeypatch, candidate=make_candidate(), run_fn=sometimes_fail)
     rep = scoring.evaluate(ws, "candidate_0", split="train", per_instance=True)
     assert rep.per_row == {"row_0": 1.0, "row_1": 0.0, "row_2": 0.0}
-    assert rep.errors == ["row_1 repeat 1: Traceback (most recent call last):"]
+    assert rep.errors == ["row_1 repeat 1: ValueError: boom"]
 
 
 def test_repeat_variance_across_stochastic_repeats(tmp_path, monkeypatch):

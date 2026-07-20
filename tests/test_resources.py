@@ -24,6 +24,7 @@ def confirmed_resources(**runtime_overrides):
             allow_package_installs=True,
             allow_model_downloads=True,
             fine_tuning=True,
+            candidate_api_providers=("openai",),
         ),
         runtime=ap.RuntimeResources(network=True, **runtime_overrides),
         data=ap.DataPolicy(external_egress=True),
@@ -136,6 +137,34 @@ def test_pi_data_access_requires_egress_or_confirmed_local_model():
         data=ap.DataPolicy(external_egress=False),
         confirmed=True,
     ).pi_may_receive_task_data is True
+
+
+def test_runtime_api_needs_confirmed_candidate_evaluation_access():
+    incomplete = ap.Resources(
+        search=ap.SearchResources(
+            allow_package_installs=True,
+            allow_model_downloads=True,
+            candidate_api_providers=None,
+        ),
+        runtime=ap.RuntimeResources(network=True, api_providers=("openai",)),
+        data=ap.DataPolicy(external_egress=True),
+        confirmed=True,
+    )
+    assert any("candidate evaluations" in question for question in incomplete.questions)
+    assert incomplete.feasibility()[3]["feasible"] is False
+
+    confirmed_absent = ap.Resources(
+        search=ap.SearchResources(
+            allow_package_installs=True,
+            allow_model_downloads=True,
+            candidate_api_providers=(),
+        ),
+        runtime=ap.RuntimeResources(network=True, api_providers=("openai",)),
+        data=ap.DataPolicy(external_egress=True),
+        confirmed=True,
+    )
+    confirmed_absent.ensure_confirmed()
+    assert confirmed_absent.feasibility()[3]["feasible"] is False
 
 
 def test_offline_minimal_profile_keeps_code_and_rules():

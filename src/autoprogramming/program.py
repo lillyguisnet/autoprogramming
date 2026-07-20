@@ -230,6 +230,18 @@ class Program:
 
         if ws.active.get("finalized"):
             return self._load_final_report(ws)
+        if ws.portfolio_json.exists():
+            from .portfolio import Portfolio
+
+            portfolio = Portfolio.load(ws.portfolio_json)
+            if portfolio.unresolved_blockers:
+                print(
+                    "[autoprogramming] search is paused for human confirmation of "
+                    "blocked approaches. Fix and retry them, or explicitly confirm "
+                    "their exclusion with prg.resolve_blocker(...); no fallback "
+                    "implementation was accepted."
+                )
+                return None
         scores = json.loads(ws.scores_json.read_text())
         if scores.get("val_scored"):
             if ws.portfolio_json.exists():
