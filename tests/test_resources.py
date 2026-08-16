@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -127,8 +128,9 @@ def test_pi_data_access_requires_egress_or_confirmed_local_model():
         confirmed=True,
     )
     assert remote_private.pi_may_receive_task_data is False
-    assert ap.Resources(
+    local_private = ap.Resources(
         search=ap.SearchResources(
+            pi_models=("qwen-local/qwen"),
             pi_local=True,
             allow_package_installs=False,
             allow_model_downloads=False,
@@ -136,7 +138,9 @@ def test_pi_data_access_requires_egress_or_confirmed_local_model():
         runtime=ap.RuntimeResources(network=False),
         data=ap.DataPolicy(external_egress=False),
         confirmed=True,
-    ).pi_may_receive_task_data is True
+    )
+    assert local_private.pi_may_receive_task_data is True
+    assert local_private.feasibility()[3]["feasible"] is True
 
 
 def test_runtime_api_needs_confirmed_candidate_evaluation_access():
@@ -165,6 +169,98 @@ def test_runtime_api_needs_confirmed_candidate_evaluation_access():
     )
     confirmed_absent.ensure_confirmed()
     assert confirmed_absent.feasibility()[3]["feasible"] is False
+
+
+def test_remote_compute_never_assumes_ssh_transport():
+    with pytest.raises(ResourceError, match="transport must be chosen explicitly"):
+        ap.RemoteCompute(endpoint="gpu-box")
+
+
+def test_remote_compute_is_optional_confirmed_capability_and_round_trips():
+    remote = ap.RemoteCompute(
+        endpoint="gpu-box",
+        transport="ssh",
+        workdir="/srv/ap",
+        cpu_cores=32,
+        memory_gb=128,
+        gpu="cuda:0",
+        gpu_vram_gb=48,
+        max_parallel_gpu_jobs=1,
+        min_free_gpu_vram_gb=20,
+    )
+    resources = ap.Resources(
+        search=ap.SearchResources(
+            allow_package_installs=True,
+            allow_model_downloads=True,
+            remote_compute=remote,
+        ),
+        runtime=ap.RuntimeResources(network=False),
+        data=ap.DataPolicy(external_egress=False),
+        confirmed=True,
+    )
+    loaded = ap.Resources.from_dict(resources.to_dict())
+    assert loaded.search.remote_compute == remote
+    assert loaded.search.remote_compute.max_parallel_gpu_jobs == 1
+
+
+def test_pi_registry_discovery_keeps_active_first_and_same_provider_only(
+    monkeypatch,
+):
+    import autoprogramming.resources as resources_mod
+
+    monkeypatch.setattr(resources_mod.shutil, "which", lambda _name: "/bin/pi")
+    monkeypatch.setattr(
+        resources_mod.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "provider model context max-out thinking images\n"
+                "openai-codex active 100 10 yes no\n"
+                "openai-codex stronger 100 10 yes no\n"
+                "qwen-local local 100 10 yes no\n"
+            ),
+        ),
+    )
+    assert resources_mod._available_pi_model_patterns(
+        "openai-codex/active:max"
+    ) == ("openai-codex/active:max", "openai-codex/stronger")
+
+
+def test_live_pi_model_is_recorded_without_copying_credentials(monkeypatch):
+    monkeypatch.setenv("PI_PROVIDER", "openai-codex")
+    monkeypatch.setenv("PI_MODEL", "gpt-5.6-sol")
+    monkeypatch.setenv("PI_REASONING_LEVEL", "max")
+    resources = ap.Resources(
+        search=ap.SearchResources(
+            allow_package_installs=False,
+            allow_model_downloads=False,
+        ),
+        runtime=ap.RuntimeResources(network=True),
+        data=ap.DataPolicy(external_egress=True),
+        confirmed=True,
+    ).with_current_pi_model()
+    assert resources.search.pi_models[0] == "openai-codex/gpt-5.6-sol:max"
+    assert "key" not in json.dumps(resources.to_dict()).lower()
+
+
+def test_pi_subscription_keeps_model_call_avenues_visible_without_api_key():
+    resources = ap.Resources(
+        search=ap.SearchResources(
+            pi_models=("openai-codex/gpt-5.6-sol:max",),
+            candidate_api_providers=(),
+            allow_package_installs=False,
+            allow_model_downloads=False,
+        ),
+        runtime=ap.RuntimeResources(network=False, offline=True),
+        data=ap.DataPolicy(external_egress=True),
+        confirmed=True,
+    )
+    feasible = resources.feasibility()
+    assert feasible[2]["feasible"] is True
+    assert feasible[3]["feasible"] is True
+    assert feasible[3]["deployable"] is False
+    assert "Pi" in feasible[3]["reason"]
 
 
 def test_offline_minimal_profile_keeps_code_and_rules():

@@ -71,6 +71,9 @@ class AvenueSpec:
     max_rounds: int = 3
     wildcard: bool = False
     compose_from: tuple[str, ...] = ()
+    research_sources: tuple[str, ...] = ()
+    deployment_notes: tuple[str, ...] = ()
+    worker_model: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tier", ApproachTier(int(self.tier)))
@@ -80,6 +83,8 @@ class AvenueSpec:
         object.__setattr__(self, "required_mechanisms", tuple(self.required_mechanisms))
         object.__setattr__(self, "forbidden_substitutions", tuple(self.forbidden_substitutions))
         object.__setattr__(self, "compose_from", tuple(self.compose_from))
+        object.__setattr__(self, "research_sources", tuple(self.research_sources))
+        object.__setattr__(self, "deployment_notes", tuple(self.deployment_notes))
         if self.allow_cross_tier_fallback and self.tier != ApproachTier.COMPOSITION:
             raise ValueError(
                 "Cross-tier fallback is reserved for an explicit composition avenue; "
@@ -91,6 +96,8 @@ class AvenueSpec:
             raise ValueError(f"Avenue {self.id!r} needs a title, hypothesis, and mechanism.")
         if self.max_rounds < 1:
             raise ValueError("max_rounds must be at least 1.")
+        if self.worker_model is not None and not self.worker_model.strip():
+            raise ValueError("worker_model must be a non-empty Pi model pattern.")
 
     @property
     def fingerprint(self) -> str:
@@ -113,6 +120,7 @@ class AvenueSpec:
                 "required_capabilities", "required_mechanisms",
                 "forbidden_substitutions", "allow_cross_tier_fallback",
                 "max_rounds", "wildcard", "compose_from",
+                "research_sources", "deployment_notes", "worker_model",
             )
             if key in value
         }
@@ -134,6 +142,7 @@ class AvenueState:
     audits: list[dict] = field(default_factory=list)
     blocker: dict | None = None
     human_retry_confirmed: bool = False
+    failures: list[dict] = field(default_factory=list)
 
     def begin_candidate(self, candidate: str) -> None:
         """Journal an imported candidate before evaluation starts."""
@@ -156,10 +165,22 @@ class AvenueState:
         self.compliance_attempts += 1
         self.audits.append(dict(audit))
 
+    def record_failure(
+        self, kind: str, details: list[str], *, candidate=None, repairable=True
+    ) -> None:
+        """Keep implementation evidence without declaring the family failed."""
+        self.failures.append({
+            "kind": str(kind),
+            "details": [str(v) for v in details],
+            "candidate": candidate,
+            "repairable": bool(repairable),
+        })
+
     def record_blocker(self, kind: str, details: list[str], *, candidate=None) -> None:
         """Pause this avenue until a human chooses retry or confirmed exclusion."""
         self.pending_candidate = None
         self.status = AvenueStatus.BLOCKED
+        self.record_failure(kind, details, candidate=candidate)
         self.human_retry_confirmed = False
         self.blocker = {
             "kind": str(kind),
@@ -186,9 +207,14 @@ class AvenueState:
         self.notes.append(f"human blocker resolution: {json.dumps(resolution, sort_keys=True)}")
         self.blocker = None
         self.human_retry_confirmed = action == "retry"
-        self.status = (
-            AvenueStatus.PLANNED if action == "retry" else AvenueStatus.INFEASIBLE
-        )
+        if action == "exclude":
+            self.status = AvenueStatus.INFEASIBLE
+        else:
+            self.status = (
+                AvenueStatus.EVALUATED
+                if self.candidates
+                else AvenueStatus.PLANNED
+            )
 
     @classmethod
     def from_dict(cls, value: dict) -> "AvenueState":
@@ -212,6 +238,7 @@ class AvenueState:
             audits=[dict(v) for v in value.get("audits", [])],
             blocker=(dict(value["blocker"]) if value.get("blocker") else None),
             human_retry_confirmed=bool(value.get("human_retry_confirmed", False)),
+            failures=[dict(v) for v in value.get("failures", [])],
         )
 
     def to_dict(self) -> dict:
@@ -229,6 +256,7 @@ class AvenueState:
             "audits": [dict(v) for v in self.audits],
             "blocker": self.blocker,
             "human_retry_confirmed": self.human_retry_confirmed,
+            "failures": [dict(v) for v in self.failures],
         }
 
 
@@ -284,6 +312,51 @@ class Portfolio:
                     specs.append(default_avenue(ApproachTier(tier), resources))
                 elif not fact["feasible"]:
                     exclusions.setdefault(tier, str(fact["reason"]))
+            has_pi_experiment = any(
+                any(
+                    capability.startswith("pi-model:")
+                    for capability in spec.required_capabilities
+                )
+                for spec in specs
+            )
+            if (
+                resources.search.pi_models
+                and resources.feasibility()[int(ApproachTier.SINGLE_MODEL_CALL)][
+                    "feasible"
+                ]
+                and not has_pi_experiment
+            ):
+                existing_ids = {spec.id for spec in specs}
+                pi_id = "pi-subscription-call"
+                suffix = 2
+                while pi_id in existing_ids:
+                    pi_id = f"pi-subscription-call-{suffix}"
+                    suffix += 1
+                specs.append(AvenueSpec(
+                    id=pi_id,
+                    tier=ApproachTier.SINGLE_MODEL_CALL,
+                    title="Authenticated Pi subscription call",
+                    hypothesis=(
+                        "A capable subscription model may occupy a useful "
+                        "quality frontier without a raw provider API key."
+                    ),
+                    implementation_brief=(
+                        "Implement one persistent Pi CLI/RPC model call with "
+                        "task-specific instructions and robust typed parsing."
+                    ),
+                    mechanism="one persistent OAuth-backed Pi subscription model call",
+                    required_capabilities=(
+                        f"pi-model:{resources.search.pi_models[0]}",
+                    ),
+                    required_mechanisms=(
+                        "one live Pi CLI/RPC subscription model call",
+                    ),
+                    forbidden_substitutions=(
+                        "raw SDK API substitute", "local rules fallback",
+                        "classical ML fallback",
+                    ),
+                    worker_model=resources.search.pi_models[0],
+                ))
             if effective_policy.require_wildcard and not any(s.wildcard for s in specs):
                 specs.append(AvenueSpec(
                     id="wildcard",
@@ -355,21 +428,30 @@ class Portfolio:
         if unexplained:
             raise ValueError(f"Portfolio exclusions need reasons for tiers: {unexplained}.")
 
+    @staticmethod
+    def _conclusive(avenue: AvenueState) -> bool:
+        """Whether an avenue supplies honest family-level evidence.
+
+        A worker crash, noncompliant substitute, or broken implementation is
+        not evidence that the assigned mechanism was attempted successfully.
+        Only evaluated implementations or an explicit infeasibility/closure can
+        satisfy breadth.
+        """
+        return avenue.status in (
+            AvenueStatus.EVALUATED,
+            AvenueStatus.STAGNANT,
+            AvenueStatus.CLOSED,
+            AvenueStatus.INFEASIBLE,
+        )
+
     @property
     def breadth_complete(self) -> bool:
         if any(avenue.pending_candidate for avenue in self.avenues):
             return False
-        if any(
-            avenue.status == AvenueStatus.BLOCKED and avenue.blocker is not None
-            for avenue in self.avenues
-        ):
+        if self.unresolved_blockers:
             return False
         represented = {
-            int(a.spec.tier)
-            for a in self.avenues
-            if a.status not in (
-                AvenueStatus.PLANNED, AvenueStatus.RUNNING, AvenueStatus.BLOCKED
-            )
+            int(a.spec.tier) for a in self.avenues if self._conclusive(a)
         }
         return all(
             not info["feasible"] or tier > 7 or tier in represented
@@ -384,14 +466,24 @@ class Portfolio:
             return False
         if self.policy.require_wildcard:
             wildcards = [a for a in self.avenues if a.spec.wildcard]
-            if not wildcards or not any(
-                a.status not in (
-                    AvenueStatus.PLANNED, AvenueStatus.RUNNING, AvenueStatus.BLOCKED
-                )
-                for a in wildcards
-            ):
+            if not wildcards or not any(self._conclusive(a) for a in wildcards):
                 return False
-        return any(a.status in (AvenueStatus.EVALUATED, AvenueStatus.STAGNANT) for a in self.avenues)
+        successful = [
+            a for a in self.avenues
+            if a.status in (AvenueStatus.EVALUATED, AvenueStatus.STAGNANT)
+        ]
+        if not successful:
+            return False
+        # A family is not dismissed on one brittle implementation. Successful
+        # avenues need the configured number of materially different attempts
+        # unless their explicit contract caps them lower (bootstrap controllers
+        # use a one-configuration policy).
+        if any(
+            a.rounds < min(self.policy.min_configs_before_abandon, a.spec.max_rounds)
+            for a in successful
+        ):
+            return False
+        return True
 
     @property
     def unresolved_blockers(self) -> list[AvenueState]:
@@ -480,15 +572,42 @@ def ensure_avenue_contract(spec: AvenueSpec, resources: Resources) -> AvenueSpec
     default mechanism boundary by omitting contract fields from its JSON plan.
     """
     default = default_avenue(spec.tier, resources)
+    pi_assigned = any(
+        capability.startswith("pi-model:")
+        for capability in spec.required_capabilities
+    )
     permitted = tuple(
         provider for provider in spec.allowed_api_providers
         if provider in set(default.allowed_api_providers)
     )
+    default_capabilities = tuple(
+        capability
+        for capability in default.required_capabilities
+        if not (pi_assigned and capability.startswith("candidate-api:"))
+    )
+    pi_note = (
+        (
+            "requires the Pi CLI and an authenticated model subscription at "
+            "deployment; no raw provider API key is required",
+        )
+        if pi_assigned
+        else ()
+    )
+    if (
+        spec.worker_model is not None
+        and spec.worker_model not in set(resources.search.pi_models)
+    ):
+        raise ValueError(
+            f"Avenue {spec.id!r} requested unavailable Pi worker model "
+            f"{spec.worker_model!r}. Choose from search.pi_models."
+        )
     return replace(
         spec,
-        allowed_api_providers=(permitted or default.allowed_api_providers),
+        allowed_api_providers=(
+            () if pi_assigned else (permitted or default.allowed_api_providers)
+        ),
         required_capabilities=tuple(dict.fromkeys(
-            (*default.required_capabilities, *spec.required_capabilities)
+            (*default_capabilities, *spec.required_capabilities)
         )),
         required_mechanisms=tuple(dict.fromkeys(
             (*default.required_mechanisms, *spec.required_mechanisms)
@@ -496,6 +615,22 @@ def ensure_avenue_contract(spec: AvenueSpec, resources: Resources) -> AvenueSpec
         forbidden_substitutions=tuple(dict.fromkeys(
             (*default.forbidden_substitutions, *spec.forbidden_substitutions)
         )),
+        deployment_notes=tuple(dict.fromkeys(
+            (*default.deployment_notes, *pi_note, *spec.deployment_notes)
+        )),
+        max_rounds=(
+            spec.max_rounds
+            if spec.tier == ApproachTier.COMPOSITION
+            else max(2, spec.max_rounds)
+        ),
+        worker_model=(
+            spec.worker_model
+            if spec.worker_model in set(resources.search.pi_models)
+            else (
+                resources.search.pi_models[0]
+                if resources.search.pi_models else None
+            )
+        ),
         allow_cross_tier_fallback=(spec.tier == ApproachTier.COMPOSITION),
     )
 
@@ -510,33 +645,53 @@ def default_avenue(tier: ApproachTier, resources: Resources) -> AvenueSpec:
         ApproachTier.MODEL_GRAPH,
         ApproachTier.SINGLE_MODEL_CALL,
     ) else ()
+    pi_models = tuple(resources.search.pi_models) if tier in (
+        ApproachTier.GENERALIST_AGENT,
+        ApproachTier.MODEL_GRAPH,
+        ApproachTier.SINGLE_MODEL_CALL,
+    ) else ()
+    model_capabilities = (
+        tuple(f"candidate-api:{provider}" for provider in providers)
+        if providers
+        else tuple(f"pi-model:{model}" for model in pi_models[:1])
+    )
+    pi_runtime_notes = (
+        (
+            "requires the Pi CLI and an authenticated model subscription at "
+            "deployment; no raw provider API key is required",
+        )
+        if pi_models and not providers
+        else ()
+    )
+    deployment_fit_notes = (
+        (
+            "search-feasible but outside the confirmed runtime deployment "
+            "envelope; remote/build resources are not assumed in production",
+        )
+        if not bool(resources.feasibility()[int(tier)]["deployable"])
+        else ()
+    )
     contract = {
         ApproachTier.GENERALIST_AGENT: {
             "required_mechanisms": ("a live runtime tool-using reasoning agent",),
             "forbidden_substitutions": (
                 "classical ML fallback", "rules fallback", "lookup fallback",
             ),
-            "required_capabilities": tuple(
-                f"candidate-api:{provider}" for provider in providers
-            ),
+            "required_capabilities": model_capabilities,
         },
         ApproachTier.MODEL_GRAPH: {
             "required_mechanisms": ("multiple live model calls with explicit stages",),
             "forbidden_substitutions": (
                 "single-call substitute", "classical ML fallback", "rules fallback",
             ),
-            "required_capabilities": tuple(
-                f"candidate-api:{provider}" for provider in providers
-            ),
+            "required_capabilities": model_capabilities,
         },
         ApproachTier.SINGLE_MODEL_CALL: {
             "required_mechanisms": ("one live model-provider call",),
             "forbidden_substitutions": (
                 "classical ML fallback", "rules fallback", "lookup fallback",
             ),
-            "required_capabilities": tuple(
-                f"candidate-api:{provider}" for provider in providers
-            ),
+            "required_capabilities": model_capabilities,
         },
         ApproachTier.FINETUNED_MODEL: {
             "required_mechanisms": ("inference through the assigned fine-tuned model",),
@@ -580,4 +735,11 @@ def default_avenue(tier: ApproachTier, resources: Resources) -> AvenueSpec:
         required_mechanisms=contract["required_mechanisms"],
         forbidden_substitutions=contract["forbidden_substitutions"],
         allow_cross_tier_fallback=(tier == ApproachTier.COMPOSITION),
+        deployment_notes=tuple(dict.fromkeys(
+            (*pi_runtime_notes, *deployment_fit_notes)
+        )),
+        worker_model=(
+            resources.search.pi_models[0]
+            if resources.search.pi_models else None
+        ),
     )

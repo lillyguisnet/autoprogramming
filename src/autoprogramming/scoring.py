@@ -894,9 +894,12 @@ def evaluate(
     expected_by_row: dict[str, dict] = {}
     run_errors: list[str] = []
 
+    session_factory = getattr(runner_mod, "candidate_session", None)
     session_cls = getattr(runner_mod, "CandidateSession", None)
     session_context = (
-        session_cls(workspace, candidate)
+        session_factory(workspace, candidate)
+        if session_factory is not None
+        else session_cls(workspace, candidate)
         if session_cls is not None
         else contextlib.nullcontext(None)
     )

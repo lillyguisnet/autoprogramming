@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Made the human-facing Pi session the sole strategy orchestrator; live runs use
+  staged host APIs instead of spawning a second context-poor strategy process.
+- Added mandatory, persisted web research before host/headless portfolio plans.
+- Added active/default plus same-provider Pi registry model assignment for
+  workers, a mandatory measured subscription-runtime avenue when feasible, and explicit
+  deployment labels without raw SDK API keys.
+- Added optional user-provided remote search compute with explicit transport,
+  selective heavy-work placement, remote candidate sessions, and per-target
+  GPU device/concurrency/VRAM admission with exclusive retries.
+- Added implementation-failure diagnosis and repair loops, independent second
+  configurations, suspicious-output review, and evidence-rich human blockers;
+  broken/noncompliant attempts no longer satisfy portfolio breadth.
 - Made portfolio avenues hard mechanism contracts: implementation workers may
   not replace a blocked API, deep-model, classical, or rules approach with
   another family merely to avoid an error.

@@ -395,6 +395,11 @@ class Workspace:
         return self.root / "resources.json"
 
     @property
+    def research_json(self) -> Path:
+        """Timestamped web queries and citations used to plan the portfolio."""
+        return self.root / ".ap" / "controller" / "research.json"
+
+    @property
     def portfolio_json(self) -> Path:
         """Controller-owned portfolio state (development-time only)."""
         return self.root / ".ap" / "controller" / "portfolio.json"

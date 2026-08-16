@@ -169,6 +169,8 @@ class Program:
             )
 
         if resources is not None:
+            from dataclasses import replace
+
             from .resources import Resources
 
             if not isinstance(resources, Resources):
@@ -176,6 +178,24 @@ class Program:
                     "resources= must be an ap.Resources profile separating "
                     "search capabilities, deployment resources, and data policy."
                 )
+            # A live Pi session exposes its selected provider/model/thinking
+            # tuple to bash children. Persist that capability so workers and
+            # Pi-backed candidates inherit subscription OAuth without looking
+            # for raw API-key environment variables. On resume, reuse the pinned
+            # registry rather than letting a catalog refresh mutate the contract.
+            if ws.resources_json.exists() and not resources.search.pi_models:
+                try:
+                    pinned = Resources.from_dict(
+                        json.loads(ws.resources_json.read_text())
+                    ).search.pi_models
+                except (OSError, ValueError, TypeError):
+                    pinned = ()
+                if pinned:
+                    resources = replace(
+                        resources,
+                        search=replace(resources.search, pi_models=pinned),
+                    )
+            resources = resources.with_current_pi_model()
             resources.ensure_confirmed()
             ws.secure_splits()
             serialized = json.dumps(resources.to_dict(), indent=2) + "\n"
@@ -216,10 +236,18 @@ class Program:
 
         if backend is not None:
             be = backend
-        elif resources is not None and shutil.which("pi"):
-            from .pi_backend import PiOrchestratorBackend
+        elif resources is not None:
+            from .host_backend import HostOrchestratorBackend, in_live_pi_session
 
-            be = PiOrchestratorBackend(resources=resources)
+            if in_live_pi_session():
+                # The model already speaking with the human owns strategy. Do
+                # not create a second, stateless orchestrator behind its back.
+                be = HostOrchestratorBackend(resources=resources)
+            else:
+                # Headless Pi strategy is an explicit opt-in because it creates
+                # a separate context. Pass PiOrchestratorBackend(...) when that
+                # is truly desired; otherwise preserve the normal/manual backend.
+                be = default_backend()
         else:
             be = default_backend()
         harness = AgentHarness(ws)
@@ -230,6 +258,11 @@ class Program:
 
         if ws.active.get("finalized"):
             return self._load_final_report(ws)
+        if getattr(be, "defer_finalization", False):
+            # The current Pi session must inspect worker evidence and choose the
+            # next controller phase. Automatic finalization here would bypass
+            # that same-session orchestration boundary.
+            return None
         if ws.portfolio_json.exists():
             from .portfolio import Portfolio
 
@@ -284,10 +317,19 @@ class Program:
         analysis is itself an agent call. The returned object resumes against
         the exact normalized rows and fixed workspace split after sign-off.
         """
-        from .pi_backend import PiOrchestratorBackend
-
         rows = self._resolve_rows(data)
-        selected_backend = backend or PiOrchestratorBackend(resources=resources)
+        if backend is not None:
+            selected_backend = backend
+        else:
+            from .host_backend import HostOrchestratorBackend, in_live_pi_session
+
+            if in_live_pi_session():
+                selected_backend = HostOrchestratorBackend(resources=resources)
+            else:
+                # A separate headless Pi strategist must be requested explicitly.
+                from .backend import default_backend
+
+                selected_backend = default_backend()
         self.optimize(
             rows,
             budget,

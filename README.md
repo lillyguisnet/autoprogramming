@@ -9,7 +9,7 @@
 
 Define your inputs and outputs, and let AutoProgramming find the best implementation.
 
-**Why this is different.** Prompt optimizers (DSPy, GEPA, TextGrad) search over prompts inside a framework you must ship with. In AutoProgramming, a candidate implementation is a **plain `.py` file** — so the search space is anything Python can express (an LLM call, a regex table, scikit-learn, a local transformer, a pipeline of all four), the optimizer is a **coding agent** that reflects, edits, and evaluates, and the output is a **portable Python package** with zero runtime dependence on the optimizer. Optimization happens at dev time; what you ship is just code.
+**Why this is different.** Prompt optimizers (DSPy, GEPA, TextGrad) search over prompts inside a framework you must ship with. In AutoProgramming, a candidate implementation is a **plain `.py` file** — so the search space is anything Python can express (an LLM call, a regex table, scikit-learn, a local transformer, a pipeline of all four), and the optimizer is a **coding agent** that reflects, edits, and evaluates. Most frontier points ship as ordinary portable code with no optimizer dependency. A Pi-subscription-backed runtime is also allowed as an explicitly labelled frontier point (`requires Pi + login`), so the user—not an early feasibility heuristic—decides whether that restriction is acceptable.
 
 ## Define a program
 
@@ -56,9 +56,11 @@ translate("Hello, how are you?")
 
 ## Orchestrated portfolio search with Pi
 
-The main Pi agent is a strategy orchestrator, not a candidate author. It plans a resource-feasible portfolio across runtime agents, model graphs, single calls, fine-tunes, specialized models, classical ML, and direct code/rules. A trusted Python controller then launches isolated Pi implementation workers in parallel, one avenue each. Workers receive a generic function contract, development examples, their assigned mechanism, and their own files—never optimizer context, metric code or weights, scores, other workers, val, or test. The mechanism is a hard contract: an API worker may not become classical ML when a key is missing, and a deep-model worker may not become classical CV when Torch/GPU is unavailable. The controller audits source before import, repairs or clean-restarts violations, and never scores a cross-tier substitute under the requested avenue.
+The Pi model already speaking with the human is the strategy orchestrator, not a candidate author. In a live Pi session AutoProgramming uses `HostOrchestratorBackend` and never starts a second strategy process; this preserves the user's requirements, research, and failure reasoning in one conversation. A trusted Python controller launches only isolated implementation workers and independent auditors. Workers receive a generic function contract, development examples, their assigned mechanism, and their own files—never optimizer context, metric code or weights, scores, other workers, val, or test.
 
-Search is breadth-first by policy, not merely by prompt: every feasible family must be attempted or explicitly excluded, each successful family gets a second engineering pass, and only then does the orchestrator allocate deeper rounds and cross-tier composition. See [`docs/orchestrated-search.md`](docs/orchestrated-search.md).
+Before planning, the host runs and records current web searches. It then plans across runtime agents, model graphs, single calls, fine-tunes, specialized models, classical ML, and direct code/rules. Mechanisms are hard contracts, but engineering plans are adaptable: workers may change package/model variants within the family, batching, parsing, device placement, and setup. A broken worker, malformed output, noncompliant fallback, or suspicious zero result does not satisfy breadth. The controller investigates, repairs, and requests a materially independent configuration; ambiguity pauses for the human.
+
+Search is breadth-first by policy: every feasible family must produce evaluated faithful evidence or be explicitly excluded by the human, each successful family gets a second independent pass, and only then does the host allocate deeper rounds and cross-tier composition. See [`docs/orchestrated-search.md`](docs/orchestrated-search.md).
 
 Search-time hardware and deployment-time resources are separate contracts:
 
@@ -67,34 +69,41 @@ resources = ap.Resources(
     search=ap.SearchResources(
         max_parallel_agents=4,
         max_dollars_per_agent_call=0.05,  # reserves in-flight budget headroom
-        pi_local=True,  # required here because external_egress=False below
-        candidate_api_providers=("openai",),  # usable during candidate evaluation
+        candidate_api_providers=(),
         allow_package_installs=True,
         allow_model_downloads=True,
+        # The active Pi model/thinking level is captured automatically.
+        # If offered: remote_compute=ap.RemoteCompute(
+        #     endpoint="...", transport="ssh", ...)
+        # Transport is explicit; AutoProgramming never assumes remote means SSH.
     ),
-    runtime=ap.RuntimeResources(
-        network=True,
-        api_providers=("openai",),
-        max_dollars_per_call=0.002,
-    ),
-    data=ap.DataPolicy(external_egress=False),
+    runtime=ap.RuntimeResources(network=False),
+    data=ap.DataPolicy(external_egress=True),  # permits abstract web-research queries
     confirmed=True,
 )
 
 prepared = translate.prepare(
     pairs_df, resources=resources, budget=ap.Budget(dollars=2)
 )
-prepared.show_metric_suite()
-prepared.demonstrate_metrics([...])
-prepared.approve_metrics("user")
-report = prepared.optimize(ap.Budget(dollars=20))
+prg = ap.attach(prepared.workspace.root)
+# The current Pi session proposes/demonstrates the metric suite and obtains sign-off.
+print(prg.web_search("latest efficient approaches for <abstract task>"))
+print(prg.web_search("2026 open source <task> benchmark models"))
+prg.plan_portfolio(web_informed_avenue_specs)
+prg.orchestrate_portfolio("breadth", budget=ap.Budget(dollars=20))
+state = prg.portfolio_status()
+prg.orchestrate_portfolio("deepen", avenue_ids=[...])
+prg.orchestrate_portfolio("compose")
+report = prg.finalize()
 ```
 
-Hardware can be detected, but AutoProgramming never interprets an API key, network connection, or installed GPU as permission to send data or require that resource in production. Resource profiles store capabilities and provider names, never secrets. Under a dollar budget, Pi calls are serialized unless `max_dollars_per_agent_call` is confirmed; with that bound, each parallel call reserves headroom and settles its actual reported cost before more work launches. For unattended runs, pass an explicit `PiOrchestratorBackend(orchestrator_model=..., worker_model=..., orchestrator_timeout=..., worker_timeout=...)` to avoid inheriting an unexpectedly slow global Pi model/thinking configuration.
+Hardware can be detected, but AutoProgramming never interprets a network connection, GPU, or remote address as permission. Remote compute is used only when the user supplies `RemoteCompute`; then heavy worker/evaluation operations are staged there while orchestration stays local. Pi-runtime candidates stay beside the authenticated host because they are network-bound and OAuth credentials are never copied to the target. GPU-heavy avenues use per-target concurrency/VRAM admission (one concurrent GPU job and an 80%-free floor when card VRAM is supplied, both configurable), so contention and OOM trigger waiting/exclusive retry rather than a false approach failure.
+
+Pi subscription access is discovered from Pi's authenticated model registry and stored only as provider/model capability names—OAuth tokens remain in Pi's auth store. Workers default to the exact host model and thinking level; the host may deliberately assign another discovered subscription model. A Pi-backed candidate uses Pi CLI/RPC without raw API keys and its final-report entry states the deployment requirement. Under a dollar budget, parallel calls reserve confirmed headroom. For an explicitly headless run, pass `PiOrchestratorBackend(...)`; live Pi sessions use the same-session host instead.
 
 Metric suites distinguish **acceptance lenses** (user-approved and eligible to choose the final program) from **diagnostic lenses** (orchestrator-managed search feedback). Suite-aware search uses acceptance floors and a Pareto frontier rather than requiring one weighted scalar. The legacy primary remains a report headline for older workspaces.
 
-If an approach completely fails because API access, GPU, packages, models, or network appear unavailable, the controller pauses for human confirmation instead of silently dropping it. The user can fix the capability and request a retry, or explicitly confirm exclusion with `prg.resolve_blocker(...)`; fallback code is never the answer.
+If bounded implementation diagnosis, same-family repairs, an independent configuration, and resource verification still leave an approach blocked, the controller pauses for human confirmation instead of silently dropping it. The user can fix the capability and request a retry, or explicitly confirm exclusion with `prg.resolve_blocker(...)`; fallback code is never the answer.
 
 ## Data discipline
 
@@ -265,7 +274,11 @@ Inside the optimization loop, the agent holds `prg` — the agent-side handle to
 
 ```py
 prg.schema                                   # inspect inputs/outputs & docstrings
-prg.eval("candidate_0")                      # score on val (aggregate only, with CI)
+prg.web_search("latest ...")                 # host research; run 2+ before planning
+prg.plan_portfolio([...])                    # authored by the current Pi session
+prg.orchestrate_portfolio("breadth")         # controller launches workers, not strategy
+prg.portfolio_status()                       # audits/failures/objectives for host review
+prg.eval("candidate_0")                      # manual/legacy val scoring
 prg.eval("candidate_0", split="train", per_instance=True)   # per-row, train only
 prg.run("candidate_0", split="train", row=17)  # single traced run — train rows only
 prg.frontier()                               # Pareto frontier: best candidate per train row

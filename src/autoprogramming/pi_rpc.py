@@ -19,7 +19,6 @@ from pathlib import Path
 
 from .errors import RunnerError
 
-
 ORCHESTRATOR_SYSTEM = """You are a strategy orchestrator, not an implementer.
 You manage a breadth-first portfolio of independent Python implementation avenues.
 Never write implementation code. Never collapse the search onto an acceptable
@@ -84,6 +83,8 @@ class PiRpcClient:
         model: str | None = None,
         system_prompt: str = ORCHESTRATOR_SYSTEM,
         timeout: float = 900.0,
+        extensions: tuple[str | Path, ...] = (),
+        tools: tuple[str, ...] = (),
     ):
         if shutil.which(command[0]) is None and not Path(command[0]).exists():
             raise RunnerError(
@@ -97,6 +98,10 @@ class PiRpcClient:
             "--no-themes", "--no-context-files", "--no-approve",
             "--system-prompt", system_prompt,
         ]
+        for extension in extensions:
+            args.extend(("--extension", str(extension)))
+        if tools:
+            args.extend(("--tools", ",".join(tools)))
         if model:
             args.extend(("--model", model))
         self.timeout = timeout

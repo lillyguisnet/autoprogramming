@@ -425,6 +425,35 @@ def test_final_report_str_mirrors_readme():
     assert lines[-1] == "activated: candidate_1"
 
 
+def test_final_report_shows_pi_runtime_requirement_and_evaluation_target():
+    entries = [{
+        "candidate": "candidate_2",
+        "val_mean": 0.9,
+        "test_mean": 0.88,
+        "gap": 0.02,
+        "demoted": False,
+        "note": "healthy gap",
+        "objectives": {
+            "quality": 0.88,
+            "cost_dollars": 0.01,
+            "latency_s": 1.0,
+        },
+        "deployment_notes": [
+            "requires the Pi CLI and an authenticated model subscription"
+        ],
+        "evaluation_compute": "remote:gpu-box",
+    }]
+    rep = harness.FinalReport(
+        entries=entries,
+        activated="candidate_2",
+        val_reliability="ok",
+        frontier=["candidate_2"],
+    )
+    rendered = str(rep)
+    assert "remote:gpu-box" in rendered
+    assert "authenticated model subscription" in rendered
+
+
 def test_final_report_str_flags_unreliable_val():
     entries = [
         {"candidate": "candidate_0", "val_mean": 0.9, "test_mean": 0.88,

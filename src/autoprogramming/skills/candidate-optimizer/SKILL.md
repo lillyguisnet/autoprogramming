@@ -7,13 +7,21 @@ description: Optimize candidate implementations inside an autoprogramming worksp
 
 ## Role boundary
 
-When the Pi portfolio backend is active, the main session is an **orchestrator**:
-it plans and allocates avenues but never implements candidates itself. The
-trusted Python controller launches implementation-only Pi workers with generic
-task briefs and isolated directories. Do not send those workers `prg`, optimizer
-terminology, metric code/names/weights, scores, other candidates, val, or test.
-They should know only their function contract, dev-fit examples, assigned
-mechanism, resource envelope, and their own prior files.
+The Pi session speaking with the human is the **only strategy orchestrator**:
+it plans and allocates avenues but never implements candidates itself. Never
+launch another `PiOrchestratorBackend` from this session; that creates a
+context-poor duplicate. The trusted Python controller launches only
+implementation workers and independent auditors with generic task briefs and
+isolated directories. Do not send workers `prg`, optimizer terminology, metric
+code/names/weights, scores, other candidates, val, or test. They know only their
+function contract, dev-fit examples, assigned mechanism, resource envelope, and
+their own prior files.
+
+Before planning, call `prg.web_search(...)` at least twice with task-specific,
+non-private queries and inspect current sources. Submit the resulting
+`ap.AvenueSpec` list through `prg.plan_portfolio(...)`, dispatch with
+`prg.orchestrate_portfolio("breadth")`, inspect `prg.portfolio_status()`, then
+choose deepen/compose phases in this same conversation.
 
 Do not finalize merely because one avenue is acceptable. Controller policy
 requires every resource-feasible tier to be attempted or explicitly excluded,
@@ -24,12 +32,20 @@ gate, not a quality metric.
 
 An avenue is a **hard mechanism experiment**, not a request to solve the task by
 any means. It may fail, block, or score badly, but it must never switch families
-to avoid an error. No API key means the API avenue reports a setup blocker; it
-does not become classical ML. Missing Torch/GPU means the deep-model avenue
-fails clearly; it does not become classical CV. Dependencies belong in PEP 723
-and need not be globally installed. The controller audits mechanism adherence
-before import, repairs violations in-session, and clean-restarts persistent
-violators. Only explicit composition avenues may route across families.
+to avoid an error. However, implementation plans are flexible: change package
+versions, model variants within the family, batching, preprocessing, parsing,
+device placement, and setup until the assigned mechanism gets a fair test.
+Worker crashes, malformed output, noncompliance, and suspicious zero results do
+not satisfy breadth. They trigger diagnosis, same-family repair, and a fresh
+independent configuration; ambiguity goes to the human.
+
+Authenticated Pi model access does not require a raw SDK key. Pi workers default
+to the host provider/model/thinking level; an avenue may select another exact
+pattern from the discovered `pi_models` registry. Pi resolves OAuth from its auth store.
+A Pi-backed candidate should call persistent Pi CLI/RPC and is labelled as
+requiring Pi plus that login at deployment. Missing Torch/GPU still does not
+permit classical CV. Dependencies belong in PEP 723. Only explicit composition
+avenues may route across families.
 
 You are optimizing one typed program by writing, evaluating, and evolving
 complete candidate implementations — plain Python files — under a strict data
@@ -73,7 +89,14 @@ Read per-workspace facts live from the workspace, not from memory:
     prg.data.val                                 # len() only — val rows are never readable
     prg.budget                                   # remaining dollars / eval_calls / minutes
     prg.propose_metric(code, examples, primary=..)  # metric sign-off — FIRST, before any eval
-    prg.new_candidate(source=...)                # or prg.new_candidate(from_="candidate_0")
+    prg.web_search(query)                        # current sources; run 2+ before planning
+    prg.plan_portfolio(specs)                    # plan authored by THIS Pi session
+    prg.orchestrate_portfolio("breadth", budget=ap.Budget(dollars=20))
+                                                   # trusted controller + isolated workers
+    prg.portfolio_status()                       # source/audits/failures/objectives
+    prg.orchestrate_portfolio("deepen", avenue_ids=[...])
+    prg.orchestrate_portfolio("compose")
+    prg.new_candidate(source=...)                # manual/legacy path
     prg.eval("candidate_1")                      # val: every objective scored from one run
     prg.eval("candidate_1", split="train", per_instance=True)   # per-row — train only
     prg.run("candidate_1", split="train", row=17)               # full trace — train only
@@ -113,11 +136,12 @@ Rules to follow, not options:
   input); learned-feature + classical-head (embed with a pretrained model, fit a
   small classifier on top).
 - **Do not dismiss a family on one try.** A tier or model family is ruled out only
-  after a fair attempt — the right variant, sane pre/post-processing, and at least
-  two configs. A single failed config is not a dead family. Record WHY a path was
-  dropped as a scored result (`prg.eval` / `prg.compare` output), not a hunch.
-  If the whole family appears blocked by credentials, GPU, packages, downloads,
-  or network, pause and check with the human: they may be able to fix it. Retry
+  after a fair attempt and at least two materially independent faithful configs.
+  A worker/implementation failure is not a mechanism result and cannot satisfy
+  breadth. Inspect `portfolio_status()` evidence, repair creatively within the
+  family, and use a fresh worker context for the second config. If the family
+  still appears blocked by credentials, GPU, packages, downloads, or network,
+  pause and check with the human. Retry
   with `prg.resolve_blocker(id, "retry", confirmed_by="user")`; exclude only
   after the human explicitly confirms the capability is unavailable.
 - **Pick the cheapest tier that can plausibly clear the bar**, then climb only when
@@ -128,8 +152,9 @@ Rules to follow, not options:
 ## Use current tools, not remembered ones
 
 Do NOT trust training memory for "the latest" model, checkpoint, or library — it
-is stale by construction. Before you fetch a model or pick a package, CHECK what
-is current: the model hub, the package index, or a quick web search, and prefer
+is stale by construction. `plan_portfolio()` enforces a current-source gate:
+run at least two `prg.web_search(...)` queries, inspect/cite the results, then
+plan. Before you fetch a model or pick a package, check what is current and prefer
 the current best-for-cost. The classic failure is reaching for a version you
 remember (an old SAM when a newer, smaller, faster SAM exists; a superseded
 checkpoint) instead of the one that ships today. Verify a model actually exists
@@ -201,6 +226,18 @@ per known cost, not perfection at any price.
   or verbatim training outputs pasted into candidate source. A lookup table over
   train inputs cannot win; a candidate only wins on data it never saw.
 
+## Optional remote search compute
+
+Remote compute and its transport are never assumed or hard-coded. The user must
+explicitly choose the available adapter (currently `transport="ssh"`). Only when
+the user's confirmed `Resources` contains `remote_compute` does the controller stage worker tools,
+installs, training, model loads, and evaluation there. Lightweight orchestration
+and bookkeeping remain local. Pi-runtime candidates also remain beside the
+authenticated host; OAuth is never copied to the target. GPU-heavy avenues hold
+target-specific leases (default one at a time), wait for free VRAM, and retry contention/OOM
+exclusively; they must not fall back to local compute or count contention as an
+approach failure. If remote access breaks, consult the user.
+
 ## Candidate conventions: PEP 723 single-file scripts in candidates/
 
 - Each candidate is candidates/candidate_<n>.py defining `predict(<input names>)`
@@ -218,10 +255,15 @@ per known cost, not perfection at any price.
 - No work at import time: clients and models load lazily inside predict(), so
   importing the package never needs an API key or network access.
 - **Never add a cross-family safety fallback.** Provider/model retries and robust
-  parsing are valid; `if no key: use sklearn`, `except ImportError: use cv2`, or
+  parsing are valid. If task.md lists an authenticated Pi model, use Pi CLI/RPC
+  instead of checking for an `*_API_KEY`; `if no key: use sklearn`,
+  `except ImportError: use cv2`, or
   `if no GPU: use rules` are invalid. Raise a precise setup error instead. A
-  faithful zero-scoring failure teaches the portfolio that the mechanism is
-  blocked; a high-scoring substitute corrupts the experiment.
+  suspicious zero result triggers implementation diagnosis and an independent
+  configuration; it does not by itself establish that the mechanism is blocked.
+  A high-scoring substitute corrupts the experiment.
+- A candidate that invokes Pi CLI/RPC must declare `[tool.ap]` with
+  `pi_runtime = true`, so evaluation retains the host OAuth boundary.
 - A candidate that makes no stochastic calls should declare `[tool.ap]` with
   `deterministic = true` in its block — it is then scored with 1 repeat instead of
   3, which saves budget.

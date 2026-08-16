@@ -68,16 +68,22 @@ the optimizer figure out.
    sign-off. Acceptance roles, floors, and preference order are frozen before
    val selection; diagnostic lenses may evolve and re-score cached outputs.
 5. **What resources exist while SEARCHING?** CPU/RAM/disk, GPU + VRAM,
-   package/model-download permission, fine-tuning services, permitted Pi models,
-   **which candidate API providers actually have usable evaluation-time access**
-   (capability names only, never secret values), maximum parallel workers, and a
-   conservative maximum dollars per agent call if parallel Pi spend should be
-   reserved rather than serialized.
+   package/model-download permission, fine-tuning services, authenticated Pi
+   subscription models, candidate API providers, maximum parallel workers, and
+   a conservative maximum dollars per agent call. Ask whether the user offers
+   optional remote compute; never assume or hard-code one. If supplied, record
+   its endpoint/capabilities with `ap.RemoteCompute` and prefer it for heavy
+   installs, training, model loading, and evaluation while keeping lightweight
+   orchestration local. Pi-runtime candidates stay beside the authenticated
+   host—never copy OAuth credentials to remote compute. Default remote GPU
+   concurrency is one to avoid VRAM contention.
 6. **What may the SHIPPED PROGRAM require?** Runtime CPU/GPU/RAM/network,
-   candidate API providers, latency/cost/artifact limits, and whether task data
-   may leave the machine. Search and runtime resources are different contracts.
-   Never persist credentials; construct and confirm `ap.Resources` from capability
-   names and constraints. Cost and latency become real objectives.
+   Pi plus a logged-in subscription, candidate API providers,
+   latency/cost/artifact limits, and whether task data may leave the machine.
+   Search may still measure Pi-backed approaches outside the preferred runtime
+   envelope; label their deployment requirements clearly and let the user choose
+   the frontier point. Never persist credentials—Pi OAuth remains in Pi's auth
+   store and remote authentication remains in its transport configuration.
 
 ## Define the program
 
@@ -128,38 +134,81 @@ ap.Budget(dollars=20)                    # or eval_calls=2000, or minutes=30
 ap.Budget(dollars=20, minutes=60)        # combinable; first limit hit stops the run
 ```
 
-## Prepare, approve, then run the Pi portfolio
+## Prepare, approve, research, then run the Pi portfolio
+
+**In a live Pi conversation, the model speaking with the human is the one and
+only strategy orchestrator. Never launch `PiOrchestratorBackend` from that
+session:** doing so creates a second, context-poor orchestrator. The default
+`HostOrchestratorBackend` detects the live session and pauses for this agent to
+do metric design, web research, planning, failure inspection, and finalization.
+The trusted Python controller—not another strategist—dispatches workers and
+enforces policy.
 
 ```py
 resources = ap.Resources(
-    search=ap.SearchResources(max_parallel_agents=4,
-                              max_dollars_per_agent_call=0.05,
-                              pi_local=True,  # egress is false below
-                              candidate_api_providers=(),  # no candidate API access in this offline profile
-                              allow_package_installs=True,
-                              allow_model_downloads=True),
+    search=ap.SearchResources(
+        max_parallel_agents=4,
+        max_dollars_per_agent_call=0.05,
+        # The active Pi provider/model/thinking level is captured automatically.
+        candidate_api_providers=(),
+        allow_package_installs=True,
+        allow_model_downloads=True,
+        # ONLY if supplied: ap.RemoteCompute(endpoint=..., transport="ssh", ...).
+        # Ask for the transport; never assume that remote compute means SSH.
+    ),
     runtime=ap.RuntimeResources(network=False),
-    data=ap.DataPolicy(external_egress=False),
+    data=ap.DataPolicy(external_egress=True),  # required for task-derived web queries
     confirmed=True,
 )
-prepared = translate.prepare(pairs, resources=resources,
-                             budget=ap.Budget(dollars=2))
-prepared.show_metric_suite()
-prepared.demonstrate_metrics(user_chosen_examples)
-prepared.approve_metrics("user")
-report = prepared.optimize(ap.Budget(dollars=20))
+prepared = translate.prepare(
+    pairs, resources=resources, budget=ap.Budget(dollars=2)
+)
+prg = ap.attach(prepared.workspace.root)
 ```
 
-The main Pi agent orchestrates only. A deterministic Python controller enforces
-breadth and dispatches parallel, implementation-only Pi workers. Those workers
-must never receive optimizer identity, metric names/code/weights, leaderboard
+Propose metric code yourself in this conversation, demonstrate every lens on
+real examples, obtain explicit user approval, then write/approve the suite. Next,
+**search before planning**:
+
+```py
+print(prg.web_search("latest efficient models and methods for <abstract task>"))
+print(prg.web_search("2026 open source <task> benchmark best approaches"))
+# Inspect sources; never put private examples in a query.
+
+prg.plan_portfolio(web_informed_avenue_specs)
+status = prg.orchestrate_portfolio(
+    "breadth", budget=ap.Budget(dollars=20)
+)
+# Inspect status: source/audits/setup/failures/objectives for every avenue.
+status = prg.orchestrate_portfolio("deepen", avenue_ids=[...])
+status = prg.orchestrate_portfolio("compose")
+report = prg.finalize()  # only when status says may_finalize
+```
+
+`web_informed_avenue_specs` is the current orchestrator's task-specific list of
+`ap.AvenueSpec` objects; each may cite `research_sources`. `plan_portfolio()`
+refuses until at least two searches and two distinct sources are recorded.
+Outside a live Pi session, a caller may explicitly choose the legacy headless
+`PiOrchestratorBackend`; that fallback owns its own web-enabled strategy process.
+
+The deterministic Python controller enforces breadth and dispatches parallel,
+implementation-only Pi workers. Workers default to the exact active Pi model and
+thinking level; an avenue may name another exact discovered `pi_models` pattern
+when a stronger specialist is useful. Pi resolves stored OAuth/subscription authentication; absence
+of `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` does not invalidate Pi access. A
+Pi-backed candidate calls Pi CLI/RPC and is reported as requiring Pi plus the
+logged-in subscription at deployment, so the user can accept or reject that
+frontier point.
+
+Workers never receive optimizer identity, metric names/code/weights, leaderboard
 scores, other workers, val, or test. They see a generic function task, dev-fit
 examples, one assigned mechanism, permitted resources, and their own prior files.
 
 **Mechanism fidelity is absolute.** An avenue may fail, be blocked, or score
 poorly, but it may never substitute another approach family to keep the function
-working. Missing Torch, a model, an API key, GPU, network, or package is a setup
-failure—not permission to replace a deep/API avenue with classical CV, rules, or
+working. Missing Torch, a model, a genuinely required raw API key, GPU, network,
+or package is a setup failure—not permission to replace a deep/API avenue with
+classical CV, rules, or
 a lookup. Workers must declare dependencies in PEP 723 and fail clearly when a
 required capability is truly unavailable. Before import, the controller performs
 deterministic plus independent semantic adherence checks; rejected source is
@@ -182,14 +231,12 @@ What happens mechanically:
   NOT among the created files — it appears only after the metric is proposed
   and approved (the sign-off step below); until then any scoring attempt
   raises `MetricNotApprovedError`.
-- With a confirmed `Resources` profile and Pi installed, the default is a Pi
-  strategy orchestrator plus parallel implementation-only Pi workers. Legacy
-  calls without resources retain the Claude/manual backend. **When no agent
-  backend is available**, `optimize()` prints that the workspace is ready for a manual
-  session with the `ap.attach` snippet — the workspace plus this skill is
-  everything needed to drive the loop yourself. Read
-  [references/prg-api.md](references/prg-api.md) for the complete agent-side
-  `prg` API before doing that.
+- With a confirmed `Resources` profile inside Pi, the current human-facing
+  session remains the host orchestrator and uses the staged `prg` methods above;
+  it never creates a second strategy agent. Only implementation workers and
+  independent auditors get isolated Pi contexts. Outside Pi, headless strategy
+  orchestration is explicit. Read [references/prg-api.md](references/prg-api.md)
+  for the complete host/controller API.
 - The metric set must be proposed, demonstrated on real examples, and approved
   before any scoring happens. Editing a metric's **code** later re-scores every
   candidate from its cached outputs (free — no re-runs) and archives only
@@ -205,8 +252,15 @@ What happens mechanically:
   untouchable until `finalize()` evaluates it once, at the end, on the top
   candidates, and activates the winner. See
   [references/prg-api.md](references/prg-api.md) for the full loop.
-- If an approach completely fails because infrastructure appears unavailable,
-  the controller pauses instead of accepting a fallback or discarding the tier.
+- A worker crash, malformed output, noncompliant source, dependency mistake, or
+  suspicious zero result never satisfies breadth and never proves the approach
+  failed. The controller diagnoses and repairs within the same mechanism, then
+  uses a fresh Pi context for a materially independent configuration. Remote GPU
+  work is admitted under VRAM/concurrency leases; contention/OOM is paused and
+  retried exclusively rather than scored against the approach. Only evaluated
+  faithful implementations or a human-confirmed infeasibility satisfy breadth.
+- If an approach still appears blocked after bounded investigation, the
+  controller pauses instead of accepting a fallback or discarding the tier.
   Ask the human whether they can fix it. After they do, use
   `prg.resolve_blocker("<avenue>", "retry", confirmed_by="user")`; only after
   explicit human agreement may you use `"exclude"`. Then resume `optimize()`.

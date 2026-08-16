@@ -26,22 +26,16 @@ from .adherence import (
 from .budget import BudgetLedger
 from .errors import BudgetExceededError, RunnerError
 from .objectives import MetricSuite, SelectionPolicy, approve_suite
-from .pi_rpc import (
-    ORCHESTRATOR_SYSTEM as _ORCHESTRATOR_SYSTEM,
-    PiResult,
-    PiRpcClient,
-    PiUsage,
-    json_object as _json_object,
-)
-from .pi_worker import (
-    WORKER_SYSTEM as _WORKER_SYSTEM,
-    PiWorkerRunner,
-    avenue_dir as _avenue_dir,
-    materialize_bundle as _materialize_bundle,
-    task_document as _task_document,
-    worker_env as _worker_env,
-    worker_run_dir as _worker_run_dir,
-)
+from .pi_rpc import ORCHESTRATOR_SYSTEM as _ORCHESTRATOR_SYSTEM
+from .pi_rpc import PiResult, PiRpcClient, PiUsage
+from .pi_rpc import json_object as _json_object
+from .pi_worker import WORKER_SYSTEM as _WORKER_SYSTEM
+from .pi_worker import PiWorkerRunner
+from .pi_worker import avenue_dir as _avenue_dir
+from .pi_worker import materialize_bundle as _materialize_bundle
+from .pi_worker import task_document as _task_document
+from .pi_worker import worker_env as _worker_env
+from .pi_worker import worker_run_dir as _worker_run_dir
 from .portfolio import (
     ApproachTier,
     AvenueSpec,
@@ -49,7 +43,27 @@ from .portfolio import (
     Portfolio,
     ensure_avenue_contract,
 )
+from .remote import (
+    RemoteAdmission,
+    RemoteExecutor,
+    record_candidate_placement,
+    use_remote_for_avenue,
+)
 from .resources import ResourceError, Resources
+
+__all__ = [
+    "PiOrchestratorBackend",
+    "PiResult",
+    "PiRpcClient",
+    "PiUsage",
+    "PiWorkerRunner",
+    "_WORKER_SYSTEM",
+    "_json_object",
+    "_materialize_bundle",
+    "_task_document",
+    "_worker_env",
+    "_worker_run_dir",
+]
 
 
 def _normalize_metric_suite_proposal(
@@ -224,14 +238,25 @@ def _missing_avenue_capabilities(spec: AvenueSpec, resources: Resources) -> list
     for capability in spec.required_capabilities:
         if capability == "package-installs" and resources.search.allow_package_installs is not True:
             missing.append("third-party package installation is not confirmed")
-        elif capability == "package-installs" and shutil.which("uv") is None:
+        elif (
+            capability == "package-installs"
+            and resources.search.remote_compute is None
+            and shutil.which("uv") is None
+        ):
             missing.append("uv is not installed, so isolated dependencies cannot be resolved")
         elif capability == "model-downloads" and resources.search.allow_model_downloads is not True:
             missing.append("pretrained model downloads are not confirmed")
         elif capability == "fine-tuning" and not resources.search.fine_tuning:
             missing.append("fine-tuning access is not available")
-        elif capability == "gpu" and resources.search.gpu is None:
-            missing.append("no search-time GPU is recorded")
+        elif (
+            capability == "gpu"
+            and resources.search.gpu is None
+            and (
+                resources.search.remote_compute is None
+                or resources.search.remote_compute.gpu is None
+            )
+        ):
+            missing.append("no local or user-provided remote search GPU is recorded")
         elif capability == "runtime-network" and resources.runtime.network is not True:
             missing.append("runtime network access is not confirmed")
         elif capability.startswith("candidate-api:"):
@@ -240,8 +265,26 @@ def _missing_avenue_capabilities(spec: AvenueSpec, resources: Resources) -> list
                 missing.append(
                     f"candidate evaluation has no confirmed {provider!r} provider access"
                 )
+        elif capability.startswith("pi-model:"):
+            model = capability.split(":", 1)[1]
+            if shutil.which("pi") is None:
+                missing.append(
+                    "Pi is not installed, so the authenticated subscription model "
+                    f"{model!r} cannot be used by this candidate"
+                )
+            elif model not in set(resources.search.pi_models):
+                missing.append(
+                    f"Pi model {model!r} is not in the confirmed authenticated model set"
+                )
     lowered_requirements = " ".join(spec.runtime_requirements).lower()
-    if any(token in lowered_requirements for token in ("gpu", "cuda")) and resources.search.gpu is None:
+    if (
+        any(token in lowered_requirements for token in ("gpu", "cuda"))
+        and resources.search.gpu is None
+        and (
+            resources.search.remote_compute is None
+            or resources.search.remote_compute.gpu is None
+        )
+    ):
         missing.append(
             "this avenue explicitly requires GPU/CUDA but no search-time GPU is recorded"
         )
@@ -258,12 +301,45 @@ _ENVIRONMENT_ERROR_MARKERS = (
 )
 
 
+def _artifact_tree_sha(root: Path) -> str | None:
+    """Stable artifact identity for independent-configuration checks."""
+    if not root.is_dir():
+        return None
+    digest = hashlib.sha256()
+    files = sorted(path for path in root.rglob("*") if path.is_file())
+    for path in files:
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def _environment_blocker_text(text: str) -> list[str]:
     lowered = str(text).lower()
     if any(marker in lowered for marker in _ENVIRONMENT_ERROR_MARKERS):
         compact = " ".join(str(text).split())
         return [compact[-1200:] or "worker reported an unavailable capability"]
     return []
+
+
+def _web_research_records(result: PiResult) -> list[dict]:
+    """Extract auditable search evidence from strategy-agent tool results."""
+    records: list[dict] = []
+    for message in result.messages:
+        if message.get("role") != "toolResult" or message.get("toolName") != "web_search":
+            continue
+        texts = [
+            part.get("text", "")
+            for part in message.get("content", [])
+            if part.get("type") == "text"
+        ]
+        for text in texts:
+            try:
+                value = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(value, dict) and value.get("results"):
+                records.append(value)
+    return records
 
 
 def _complete_environment_failure(report) -> list[str]:
@@ -293,12 +369,18 @@ class PiOrchestratorBackend:
         worker_timeout: float = 1200.0,
         max_compliance_repairs: int = 2,
         max_clean_restarts: int = 1,
+        max_implementation_repairs: int = 2,
+        host_orchestrated: bool = False,
         semantic_adherence_review: bool = True,
     ):
         if orchestrator_timeout <= 0 or worker_timeout <= 0:
             raise ValueError("Pi timeouts must be positive.")
-        if max_compliance_repairs < 0 or max_clean_restarts < 0:
-            raise ValueError("Compliance repair/restart counts cannot be negative.")
+        if (
+            max_compliance_repairs < 0
+            or max_clean_restarts < 0
+            or max_implementation_repairs < 0
+        ):
+            raise ValueError("Repair/restart counts cannot be negative.")
         self.command = tuple(command)
         self.orchestrator_model = orchestrator_model
         self.worker_model = worker_model
@@ -308,6 +390,8 @@ class PiOrchestratorBackend:
         self.worker_timeout = float(worker_timeout)
         self.max_compliance_repairs = int(max_compliance_repairs)
         self.max_clean_restarts = int(max_clean_restarts)
+        self.max_implementation_repairs = int(max_implementation_repairs)
+        self.host_orchestrated = bool(host_orchestrated)
         self.semantic_adherence_review = bool(semantic_adherence_review)
 
     def run(self, harness, context: dict) -> None:
@@ -330,6 +414,12 @@ class PiOrchestratorBackend:
                 "misrepresented as a security boundary."
             )
         if not metric_mod.is_approved(ws):
+            if self.host_orchestrated or context.get("host_orchestrated"):
+                print(
+                    "[autoprogramming] host orchestration paused: the current Pi "
+                    "session must propose and obtain approval for the metric suite."
+                )
+                return
             if not self._propose_metric_suite(harness, resources):
                 return
         if context.get("mode") == "prepare" or context.get("prepare_only"):
@@ -348,31 +438,108 @@ class PiOrchestratorBackend:
                     "orchestration history would lose budget and coverage state."
                 ) from exc
         else:
+            if self.host_orchestrated or context.get("host_orchestrated"):
+                raise RunnerError(
+                    "Host orchestration has no portfolio plan. The human-facing "
+                    "Pi session must run prg.web_search(...) and "
+                    "prg.plan_portfolio([...]); a second strategy orchestrator "
+                    "will not be spawned automatically."
+                )
+            if resources.data.external_egress is not True:
+                raise ResourceError(
+                    "Current-source web research is required before portfolio "
+                    "planning, but data.external_egress does not permit sending "
+                    "task-derived search queries. Ask the human to permit abstract "
+                    "research or use a pre-researched, host-authored plan; do not "
+                    "fall back to stale model memory."
+                )
             portfolio = self._create_portfolio(harness, resources)
+            portfolio.write(portfolio_path)
+        from .guards import is_bootstrap
+        if is_bootstrap(ws) and portfolio.policy.min_configs_before_abandon != 1:
+            from dataclasses import replace
+
+            portfolio.policy = replace(
+                portfolio.policy, min_configs_before_abandon=1
+            )
             portfolio.write(portfolio_path)
         self._recover_pending_avenues(harness, portfolio, portfolio_path)
         # Old/resumed plans and Pi-authored plans cannot weaken a tier contract by
         # omitting its machine-readable constraints.
         for state in portfolio.avenues:
             state.spec = ensure_avenue_contract(state.spec, resources)
+            if state.status in (
+                AvenueStatus.FAILED,
+                AvenueStatus.NONCOMPLIANT,
+            ) and state.blocker is None:
+                state.record_blocker(
+                    "legacy-implementation-failure-needs-human",
+                    state.notes[-4:] or [
+                        "older controller marked a broken implementation as a "
+                        "family outcome; it now requires investigation"
+                    ],
+                )
+        remote_failure = None
+        if (
+            resources.search.remote_compute is not None
+            and any(
+                use_remote_for_avenue(state.spec)
+                for state in portfolio.avenues
+                if state.status != AvenueStatus.INFEASIBLE
+            )
+        ):
+            try:
+                remote_executor = RemoteExecutor(resources.search.remote_compute)
+                requirements = ["command -v tar", "command -v python3"]
+                remote_executor.ssh(" && ".join(requirements))
+            except Exception as exc:
+                remote_failure = str(exc)
+        if remote_failure:
+            for state in portfolio.avenues:
+                if (
+                    not state.candidates
+                    and state.status == AvenueStatus.PLANNED
+                    and use_remote_for_avenue(state.spec)
+                ):
+                    state.record_blocker(
+                        "remote-compute-preflight",
+                        [remote_failure],
+                    )
+            portfolio.write(portfolio_path)
+            self._print_human_blockers(portfolio, portfolio_path)
+            return
+
         human_retried: set[str] = set()
         for state in portfolio.avenues:
-            if state.candidates or state.status != AvenueStatus.PLANNED:
-                continue
             if state.human_retry_confirmed:
                 human_retried.add(state.spec.id)
                 state.notes.append(
-                    "preflight retried after human confirmation that the blocked "
-                    "capability was fixed or should be attempted again"
+                    "implementation/preflight retried after human confirmation "
+                    "that the blocker was fixed or should be attempted again"
                 )
                 state.human_retry_confirmed = False
+                continue
+            if state.candidates or state.status != AvenueStatus.PLANNED:
                 continue
             missing = _missing_avenue_capabilities(state.spec, resources)
             if missing:
                 state.record_blocker("environment-preflight", missing)
         portfolio.write(portfolio_path)
 
+        def worker_for(spec: AvenueSpec) -> PiWorkerRunner:
+            remote = (
+                resources.search.remote_compute
+                if use_remote_for_avenue(spec)
+                else None
+            )
+            return PiWorkerRunner(
+                self.command,
+                timeout=self.worker_timeout,
+                remote_compute=remote,
+            )
+
         worker = PiWorkerRunner(self.command, timeout=self.worker_timeout)
+        admission = RemoteAdmission(resources.search.remote_compute)
         runnable_states = [
             a for a in portfolio.avenues
             if not a.candidates
@@ -380,6 +547,7 @@ class PiOrchestratorBackend:
             and a.spec.tier != ApproachTier.COMPOSITION
         ]
         specs = [a.spec for a in runnable_states]
+        workers = {spec.id: worker_for(spec) for spec in specs}
         for state in runnable_states:
             state.status = AvenueStatus.RUNNING
         portfolio.write(portfolio_path)
@@ -407,9 +575,13 @@ class PiOrchestratorBackend:
             ),
             ledger=ledger,
             reservation_dollars=resources.search.max_dollars_per_agent_call,
-            invoke=lambda spec: self._run_avenue(
-                harness, spec, resources, worker,
-                human_retry_confirmed=(spec.id in human_retried),
+            invoke=lambda spec: self._run_with_admission(
+                admission,
+                spec,
+                lambda: self._run_avenue(
+                    harness, spec, resources, workers[spec.id],
+                    human_retry_confirmed=(spec.id in human_retried),
+                ),
             ),
         )
         for spec in undispatched:
@@ -419,8 +591,25 @@ class PiOrchestratorBackend:
         for spec, item, error in completed:
             state = next(a for a in portfolio.avenues if a.spec.id == spec.id)
             if error is not None:
-                state.status = AvenueStatus.FAILED
-                state.notes.append(str(error))
+                state.record_failure(
+                    "worker-turn",
+                    [str(error)],
+                    repairable=True,
+                )
+                root = _avenue_dir(ws, spec.id)
+                repaired = self._repair_worker_output(
+                    harness,
+                    state,
+                    resources,
+                    workers[spec.id],
+                    root,
+                    [str(error)],
+                )
+                if repaired is None:
+                    continue
+                repaired_result, _source = repaired
+                results[spec.id] = (repaired_result, root)
+                state.status = AvenueStatus.READY
                 continue
             result, sandbox = item
             results[spec.id] = (result, sandbox)
@@ -432,34 +621,38 @@ class PiOrchestratorBackend:
         for spec in specs:
             state = next(a for a in portfolio.avenues if a.spec.id == spec.id)
             item = results.get(spec.id)
-            if item is None or state.status == AvenueStatus.FAILED:
+            if item is None:
                 continue
             pi_result, sandbox = item
             solution = sandbox / "solution.py"
-            if not solution.exists():
-                blocker = _environment_blocker_text(
-                    f"{pi_result.text}\n{pi_result.stderr}"
+            source = (
+                solution.read_text(encoding="utf-8") if solution.exists() else ""
+            )
+            if not solution.exists() or not re.search(
+                r"(?m)^def predict\s*\(", source
+            ):
+                raw = f"{pi_result.text}\n{pi_result.stderr}\n{source}"
+                details = _environment_blocker_text(raw) or [
+                    "worker did not create a solution.py with a top-level predict"
+                ]
+                state.record_failure(
+                    "incomplete-worker-output", details, repairable=True
                 )
-                if blocker:
-                    state.record_blocker("worker-reported-environment-failure", blocker)
-                else:
-                    state.status = AvenueStatus.FAILED
-                    state.notes.append("worker did not create solution.py")
-                continue
-            source = solution.read_text(encoding="utf-8")
-            if not re.search(r"(?m)^def predict\s*\(", source):
-                blocker = _environment_blocker_text(
-                    f"{pi_result.text}\n{pi_result.stderr}\n{source}"
+                repaired = self._repair_worker_output(
+                    harness,
+                    state,
+                    resources,
+                    workers[spec.id],
+                    sandbox,
+                    details,
                 )
-                if blocker:
-                    state.record_blocker("worker-reported-environment-failure", blocker)
-                else:
-                    state.status = AvenueStatus.FAILED
-                    state.notes.append("solution.py does not define predict")
-                continue
+                if repaired is None:
+                    portfolio.write(portfolio_path)
+                    continue
+                pi_result, source = repaired
             try:
                 source = self._ensure_adherent_solution(
-                    harness, state, resources, worker, sandbox,
+                    harness, state, resources, workers[spec.id], sandbox,
                     initial_task=(
                         "Implement the function described in task.md using only the "
                         "non-negotiable approach contract. Inspect examples.jsonl, "
@@ -473,68 +666,66 @@ class PiOrchestratorBackend:
             except Exception as exc:
                 # Fail closed: an unavailable auditor cannot turn unreviewed
                 # source into a valid avenue or satisfy breadth. Resume later.
-                state.status = AvenueStatus.PLANNED
-                state.notes.append(f"approach-adherence review failed: {exc}")
+                state.record_blocker(
+                    "adherence-audit-unavailable",
+                    [str(exc)],
+                )
                 portfolio.write(portfolio_path)
                 continue
             if source is None:
                 portfolio.write(portfolio_path)
                 continue
-            try:
-                from .candidates import next_name
-
-                expected_name = next_name(ws)
-                state.begin_candidate(expected_name)
-                portfolio.write(portfolio_path)
-                source = _materialize_bundle(source, sandbox, ws, spec.id)
-                cand = harness.new_candidate(source=source)
-                if cand.name != expected_name:
-                    raise RunnerError(
-                        f"Candidate journal expected {expected_name}, got {cand.name}."
-                    )
-                train_report = harness.eval(cand.name, split="train", per_instance=True)
-                environment_errors = _complete_environment_failure(train_report)
-                if environment_errors:
-                    state.record_blocker(
-                        "candidate-environment-failure", environment_errors,
-                        candidate=cand.name,
-                    )
-                    portfolio.write(portfolio_path)
-                    continue
-                val_report = harness.eval(cand.name)
-            except BudgetExceededError:
-                portfolio.write(portfolio_path)
-                raise
-            except Exception as exc:
-                blocker = _environment_blocker_text(str(exc))
-                if blocker:
-                    state.record_blocker("candidate-environment-failure", blocker)
-                else:
-                    state.status = AvenueStatus.FAILED
-                    state.notes.append(f"candidate import/eval failed: {exc}")
-                continue
-            means = {name: float(obj["mean"]) for name, obj in val_report.objectives.items()}
-            state.record_result(cand.name, means, improved=True)
-            state.notes.append(
-                f"train aggregate {train_report.mean:.4g}; val aggregate stored privately"
+            self._evaluate_solution_bundle(
+                harness,
+                state,
+                resources,
+                workers[spec.id],
+                sandbox,
+                source,
+                portfolio,
+                portfolio_path,
             )
-            portfolio.write(portfolio_path)
 
         portfolio.write(portfolio_path)
         if portfolio.unresolved_blockers:
             self._print_human_blockers(portfolio, portfolio_path)
+            # Ambiguous implementation/environment failures require the human;
+            # do not spend on deepening healthy avenues while exclusions are
+            # unresolved.
+            return
         if not any(a.candidates for a in portfolio.avenues):
             if not portfolio.unresolved_blockers:
                 print("[autoprogramming] Pi portfolio produced no evaluable implementations; inspect " + str(portfolio_path))
             return
 
         # Breadth is complete before exploitation. Give each successful family
-        # a second, stateful Pi turn so one mediocre configuration cannot dismiss
-        # an entire mechanism. Bootstrap mode deliberately skips this expansion.
+        # a materially independent Pi configuration so one brittle implementation
+        # cannot dismiss the mechanism.
+        host_mode = self.host_orchestrated or context.get("host_orchestrated")
+        if host_mode:
+            phase = context.get("host_phase", "breadth")
+            if phase == "breadth" and not is_bootstrap(ws):
+                self._deepen_avenues(
+                    harness, portfolio, resources, worker, portfolio_path
+                )
+            elif phase == "deepen":
+                selected = set(context.get("selected_ids") or ())
+                self._deepen_avenues(
+                    harness, portfolio, resources, worker, portfolio_path,
+                    selected_ids=selected,
+                )
+            elif phase == "compose":
+                self._compose_frontier(
+                    harness, portfolio, resources, worker, portfolio_path
+                )
+            portfolio.write(portfolio_path)
+            if portfolio.unresolved_blockers:
+                self._print_human_blockers(portfolio, portfolio_path)
+            # Strategy and finalization remain in the same session that talks to
+            # the human. Return all evidence through prg.portfolio_status().
+            return
+
         if not is_bootstrap(ws):
-            # A mandatory second configuration protects breadth. After that,
-            # the main Pi orchestrator allocates the final deepening round from
-            # aggregate vectors only; workers never see the dashboard.
             self._deepen_avenues(harness, portfolio, resources, worker, portfolio_path)
             decision = self._round_decision(harness, portfolio, resources)
             selected = set(decision.get("deepen") or ())
@@ -558,6 +749,12 @@ class PiOrchestratorBackend:
             )
         harness.finalize()
 
+    @staticmethod
+    def _run_with_admission(admission, spec, invoke, *, exclusive=False):
+        """Hold a target-specific CPU/GPU lease for a whole worker turn."""
+        with admission.lease(spec, exclusive=exclusive):
+            return invoke()
+
     def _charged_rpc_prompt(self, ws, resources, prompt: str, *, system: str) -> PiResult:
         """Run one synchronous Pi review call with ordinary budget accounting."""
         ledger = BudgetLedger(ws.budget_json)
@@ -574,7 +771,13 @@ class PiOrchestratorBackend:
             with PiRpcClient(
                 self.command,
                 cwd=ws.root,
-                model=self.orchestrator_model,
+                model=(
+                    self.orchestrator_model
+                    or (
+                        resources.search.pi_models[0]
+                        if resources.search.pi_models else None
+                    )
+                ),
                 system_prompt=system,
                 timeout=self.orchestrator_timeout,
             ) as client:
@@ -592,6 +795,7 @@ class PiOrchestratorBackend:
     def _charged_worker_turn(
         self, ws, resources, worker, root, task: str, *, session_id: str,
         allowed_api_providers: tuple[str, ...],
+        model: str | None = None,
     ) -> PiResult:
         ledger = BudgetLedger(ws.budget_json)
         ledger.check()
@@ -604,7 +808,7 @@ class PiOrchestratorBackend:
                 resources.search.max_dollars_per_agent_call, category="agent"
             )
         try:
-            model = self.worker_model or (
+            model = self.worker_model or model or (
                 resources.search.pi_models[0] if resources.search.pi_models else None
             )
             result = worker.run(
@@ -674,10 +878,16 @@ Edit solution.py in place. Do not preserve a fallback for safety. Missing
 packages, credentials, GPU, models, or network must produce a precise failure;
 they never justify another approach. Re-read task.md, keep the assigned
 mechanism, and syntax-check the repaired file."""
-                self._charged_worker_turn(
-                    harness.workspace, resources, worker, root, task,
-                    session_id=state.spec.id,
-                    allowed_api_providers=state.spec.allowed_api_providers,
+                self._run_with_admission(
+                    RemoteAdmission(resources.search.remote_compute),
+                    state.spec,
+                    lambda: self._charged_worker_turn(
+                        harness.workspace, resources, worker, root, task,
+                        session_id=state.spec.id,
+                        allowed_api_providers=state.spec.allowed_api_providers,
+                        model=state.spec.worker_model,
+                    ),
+                    exclusive=True,
                 )
                 continue
 
@@ -695,22 +905,380 @@ mechanism, and syntax-check the repaired file."""
                     "substituted another mechanism. Start from task.md; do not "
                     "recreate or retain any cross-family fallback."
                 )
-                self._charged_worker_turn(
-                    harness.workspace, resources, worker, root, task,
-                    session_id=f"{state.spec.id}-compliance-restart-{restarts}",
-                    allowed_api_providers=state.spec.allowed_api_providers,
+                self._run_with_admission(
+                    RemoteAdmission(resources.search.remote_compute),
+                    state.spec,
+                    lambda: self._charged_worker_turn(
+                        harness.workspace, resources, worker, root, task,
+                        session_id=f"{state.spec.id}-compliance-restart-{restarts}",
+                        allowed_api_providers=state.spec.allowed_api_providers,
+                        model=state.spec.worker_model,
+                    ),
+                    exclusive=True,
                 )
                 continue
 
-            state.status = AvenueStatus.NONCOMPLIANT
-            state.notes.append(
-                "avenue exhausted compliance repairs/restarts; no source was "
-                "imported or evaluated"
+            state.record_blocker(
+                "implementation-noncompliance-needs-human",
+                [
+                    "avenue exhausted compliance repairs/restarts; no faithful "
+                    "source was imported or evaluated"
+                ],
             )
             return None
-        state.status = AvenueStatus.NONCOMPLIANT
-        state.notes.append("worker did not leave solution.py after compliance repair")
+        state.record_blocker(
+            "implementation-noncompliance-needs-human",
+            ["worker did not leave solution.py after compliance repair"],
+        )
         return None
+
+    def _diagnose_suspicious_candidate(
+        self, harness, state, resources, source: str, train_report
+    ) -> dict:
+        """Independently inspect a zero-quality but runnable implementation."""
+        trace = ""
+        try:
+            traced = harness.run(
+                train_report.candidate, split="train", row=0
+            )
+            trace = str(traced)
+        except Exception as exc:
+            trace = f"trace unavailable: {exc}"
+        prompt = f"""Act as an implementation-debugging reviewer, not a strategy
+planner. This faithful avenue ran but produced a suspicious zero aggregate on
+its development rows. Decide whether an implementation mistake is likely before
+the mechanism is judged. Inspect dependency/model choice, preprocessing,
+input/output contract, parsing, device behavior, and obvious placeholder logic.
+Do not propose another approach family.
+
+Return JSON only:
+{{"implementation_issue_likely": true, "findings": ["..."],
+  "repair_instructions": "..."}}
+
+Approach contract:
+{json.dumps(state.spec.to_dict(), indent=2)}
+Schema:
+{harness.schema.describe()}
+One development trace:
+{trace[-6000:]}
+Source:
+---
+{source}
+---
+"""
+        result = self._charged_rpc_prompt(
+            harness.workspace,
+            resources,
+            prompt,
+            system=(
+                "You are an independent implementation debugger. Diagnose the "
+                "assigned implementation only; never plan or substitute another "
+                "approach. Return only the requested JSON object."
+            ),
+        )
+        diagnosis = _json_object(result.text)
+        state.audits.append({"reviewer": "implementation-debugger", **diagnosis})
+        return diagnosis
+
+    def _repair_worker_output(
+        self,
+        harness,
+        state,
+        resources,
+        worker,
+        root: Path,
+        details: list[str],
+    ) -> tuple[PiResult, str] | None:
+        """Give implementation failures bounded same-family repair attempts.
+
+        The worker may change dependencies, model variants, batching, device
+        placement, parsing, or other engineering details, but the avenue's hard
+        mechanism contract remains fixed. Exhaustion becomes a human blocker,
+        never evidence that the approach family failed.
+        """
+        last_details = [str(v) for v in details]
+        for attempt in range(1, self.max_implementation_repairs + 1):
+            task = f"""The implementation did not establish that the assigned
+mechanism works. Investigate and repair the implementation; do not pivot to
+another family.
+
+Observed evidence:
+- {chr(10).join(last_details[:12])}
+
+Adapt creatively within the same mechanism: verify dependency declarations and
+versions, inspect setup, choose a compatible variant of the assigned model or
+algorithm, fix input/output handling, batching, device placement, and resource
+use. An absent raw API-key environment variable is not a blocker when task.md
+lists an authenticated Pi model; use Pi's OAuth-backed CLI/RPC runtime. If GPU
+memory is temporarily occupied, reduce safe batch/cache use and leave a precise
+error so the controller can reschedule exclusively. Edit solution.py materially,
+syntax-check it, and never add a cross-family fallback."""
+            try:
+                result = self._run_with_admission(
+                    RemoteAdmission(resources.search.remote_compute),
+                    state.spec,
+                    lambda: self._charged_worker_turn(
+                        harness.workspace,
+                        resources,
+                        worker,
+                        root,
+                        task,
+                        session_id=(
+                            f"{state.spec.id}-implementation-repair-{attempt}"
+                        ),
+                        allowed_api_providers=state.spec.allowed_api_providers,
+                        model=state.spec.worker_model,
+                    ),
+                    exclusive=True,
+                )
+            except BudgetExceededError:
+                raise
+            except Exception as exc:
+                last_details = [*last_details, f"repair turn {attempt} failed: {exc}"]
+                state.record_failure(
+                    "implementation-repair-turn",
+                    [str(exc)],
+                    repairable=True,
+                )
+                continue
+            solution = root / "solution.py"
+            if not solution.exists():
+                last_details = [f"repair turn {attempt} left no solution.py"]
+                continue
+            source = solution.read_text(encoding="utf-8")
+            if not re.search(r"(?m)^def predict\s*\(", source):
+                last_details = [f"repair turn {attempt} left no top-level predict"]
+                continue
+            try:
+                source = self._ensure_adherent_solution(
+                    harness,
+                    state,
+                    resources,
+                    worker,
+                    root,
+                    initial_task=(
+                        "Repair the implementation failure while preserving the "
+                        "exact assigned mechanism."
+                    ),
+                )
+            except Exception as exc:
+                last_details = [f"repair adherence review failed: {exc}"]
+                continue
+            if source is not None:
+                return result, source
+
+        # Repairs of one file are not enough evidence to dismiss a mechanism.
+        # Make a bounded clean, independent implementation attempt with a fresh
+        # Pi context before escalating to the human.
+        for restart in range(1, self.max_clean_restarts + 1):
+            solution = root / "solution.py"
+            solution.unlink(missing_ok=True)
+            artifact_root = root / "artifacts" / state.spec.id
+            if artifact_root.exists():
+                shutil.rmtree(artifact_root)
+            state.restart_count += 1
+            task = f"""Start a materially independent implementation of the exact
+same approach contract in task.md. Earlier implementation/repair attempts failed
+for these reasons:
+- {chr(10).join(last_details[:12])}
+
+Do not recover or imitate the deleted solution. Reconsider dependency and model
+variants, setup, preprocessing, batching, parsing, and device use while keeping
+the assigned mechanism as the only answer-producing path. Create solution.py,
+test what is possible, syntax-check it, and never add a cross-family fallback."""
+            try:
+                result = self._run_with_admission(
+                    RemoteAdmission(resources.search.remote_compute),
+                    state.spec,
+                    lambda: self._charged_worker_turn(
+                        harness.workspace,
+                        resources,
+                        worker,
+                        root,
+                        task,
+                        session_id=(
+                            f"{state.spec.id}-independent-restart-{restart}"
+                        ),
+                        allowed_api_providers=state.spec.allowed_api_providers,
+                        model=state.spec.worker_model,
+                    ),
+                    exclusive=True,
+                )
+                if not solution.exists():
+                    last_details.append(
+                        f"independent restart {restart} left no solution.py"
+                    )
+                    continue
+                source = solution.read_text(encoding="utf-8")
+                source = self._ensure_adherent_solution(
+                    harness,
+                    state,
+                    resources,
+                    worker,
+                    root,
+                    initial_task=(
+                        "Build an independent faithful implementation of task.md."
+                    ),
+                )
+                if source is not None:
+                    state.notes.append(
+                        "recovered through a clean independent implementation restart"
+                    )
+                    return result, source
+            except BudgetExceededError:
+                raise
+            except Exception as exc:
+                last_details.append(
+                    f"independent restart {restart} failed: {exc}"
+                )
+                state.record_failure(
+                    "independent-implementation-restart",
+                    [str(exc)],
+                    repairable=True,
+                )
+        state.record_blocker(
+            "implementation-failure-needs-human",
+            last_details,
+        )
+        return None
+
+    def _evaluate_solution_bundle(
+        self,
+        harness,
+        state,
+        resources,
+        worker,
+        root: Path,
+        source: str,
+        portfolio,
+        portfolio_path,
+        *,
+        baseline_name: str | None = None,
+    ) -> bool:
+        """Import/evaluate with repair loops; never equate a broken build to a tier."""
+        from .candidates import next_name
+
+        ws = harness.workspace
+        current_source = source
+        admission = RemoteAdmission(resources.search.remote_compute)
+        for attempt in range(self.max_implementation_repairs + 1):
+            candidate_name = None
+            failure_details: list[str] = []
+            try:
+                expected_name = next_name(ws)
+                state.begin_candidate(expected_name)
+                portfolio.write(portfolio_path)
+                materialized = _materialize_bundle(
+                    current_source, root, ws, state.spec.id
+                )
+                cand = harness.new_candidate(source=materialized)
+                candidate_name = cand.name
+                record_candidate_placement(
+                    ws,
+                    cand.name,
+                    (
+                        "remote"
+                        if (
+                            resources.search.remote_compute is not None
+                            and use_remote_for_avenue(state.spec)
+                        )
+                        else "local"
+                    ),
+                )
+                if cand.name != expected_name:
+                    raise RunnerError(
+                        f"Candidate journal expected {expected_name}, got {cand.name}."
+                    )
+                with admission.lease(state.spec, exclusive=(attempt > 0)):
+                    train = harness.eval(
+                        cand.name, split="train", per_instance=True
+                    )
+                    expected_runs = int(train.n_rows) * int(train.n_repeats)
+                    if expected_runs > 0 and len(train.errors) >= expected_runs:
+                        failure_details = list(train.errors[:12])
+                    elif float(train.mean) <= 0.0:
+                        diagnosis = self._diagnose_suspicious_candidate(
+                            harness,
+                            state,
+                            resources,
+                            materialized,
+                            train,
+                        )
+                        if diagnosis.get("implementation_issue_likely") is not False:
+                            findings = diagnosis.get("findings") or []
+                            if isinstance(findings, str):
+                                findings = [findings]
+                            failure_details = [str(v) for v in findings]
+                            repair = str(
+                                diagnosis.get("repair_instructions") or ""
+                            ).strip()
+                            if repair:
+                                failure_details.append(repair)
+                            if not failure_details:
+                                failure_details = [
+                                    "independent debugger could not clear the "
+                                    "suspicious zero-quality implementation"
+                                ]
+                        else:
+                            val = harness.eval(cand.name)
+                    else:
+                        val = harness.eval(cand.name)
+                if not failure_details:
+                    improved = True
+                    comparison = None
+                    if baseline_name is not None:
+                        comparison = harness.compare(baseline_name, cand.name)
+                        improved = bool(comparison.improved)
+                    state.record_result(
+                        cand.name,
+                        {
+                            name: float(obj["mean"])
+                            for name, obj in val.objectives.items()
+                        },
+                        improved=improved,
+                    )
+                    state.notes.append(
+                        f"train aggregate {train.mean:.4g}; val aggregate stored privately"
+                    )
+                    if comparison is not None:
+                        state.notes.append(str(comparison))
+                    portfolio.write(portfolio_path)
+                    return True
+            except BudgetExceededError:
+                portfolio.write(portfolio_path)
+                raise
+            except Exception as exc:
+                failure_details = [str(exc)]
+
+            state.pending_candidate = None
+            state.record_failure(
+                "candidate-implementation",
+                failure_details or ["candidate failed without diagnostic output"],
+                candidate=candidate_name,
+                repairable=True,
+            )
+            portfolio.write(portfolio_path)
+            if attempt >= self.max_implementation_repairs:
+                state.record_blocker(
+                    "implementation-or-environment-needs-human",
+                    failure_details or ["candidate repeatedly failed"],
+                    candidate=candidate_name,
+                )
+                portfolio.write(portfolio_path)
+                return False
+            repaired = self._repair_worker_output(
+                harness,
+                state,
+                resources,
+                worker,
+                root,
+                failure_details,
+            )
+            if repaired is None:
+                portfolio.write(portfolio_path)
+                return False
+            _result, current_source = repaired
+        return False
 
     @staticmethod
     def _print_human_blockers(portfolio, portfolio_path) -> None:
@@ -791,8 +1359,11 @@ mechanism, and syntax-check the repaired file."""
                 if name not in avenue.candidates:
                     avenue.candidates.append(name)
                 avenue.rounds += 1
-                avenue.status = AvenueStatus.FAILED
-                avenue.notes.append(f"pending candidate recovery failed: {exc}")
+                avenue.record_blocker(
+                    "pending-candidate-recovery-needs-human",
+                    [str(exc)],
+                    candidate=name,
+                )
             portfolio.write(portfolio_path)
 
     def _round_decision(self, harness, portfolio, resources) -> dict:
@@ -823,7 +1394,7 @@ Portfolio state (aggregate vectors only):\n{json.dumps(portfolio.to_dict(), defa
             return {"deepen": [], "compose": True, "rationale": f"fallback: {exc}"}
 
     def _deepen_avenues(
-        self, harness, portfolio, resources, worker, portfolio_path,
+        self, harness, portfolio, resources, _worker, portfolio_path,
         *, selected_ids: set[str] | None = None,
     ) -> None:
         ws = harness.workspace
@@ -844,6 +1415,20 @@ Portfolio state (aggregate vectors only):\n{json.dumps(portfolio.to_dict(), defa
         except BudgetExceededError:
             return
 
+        admission = RemoteAdmission(resources.search.remote_compute)
+        avenue_workers = {
+            avenue.spec.id: PiWorkerRunner(
+                self.command,
+                timeout=self.worker_timeout,
+                remote_compute=(
+                    resources.search.remote_compute
+                    if use_remote_for_avenue(avenue.spec)
+                    else None
+                ),
+            )
+            for avenue in active
+        }
+
         def deepen(avenue):
             root = _avenue_dir(ws, avenue.spec.id)
             task = (
@@ -855,12 +1440,20 @@ Portfolio state (aggregate vectors only):\n{json.dumps(portfolio.to_dict(), defa
                 "from another family for missing packages, credentials, GPU, model, "
                 "or network; fail clearly instead. Syntax-check it."
             )
-            model = self.worker_model or (
+            model = self.worker_model or avenue.spec.worker_model or (
                 resources.search.pi_models[0] if resources.search.pi_models else None
             )
-            return worker.run(
-                root, task, model=model, session_id=avenue.spec.id,
-                allowed_api_providers=avenue.spec.allowed_api_providers,
+            # A fresh Pi context supplies a materially independent engineering
+            # configuration while its only durable context remains this avenue's
+            # own files. GPU-heavy avenues hold an exclusive/default remote lease.
+            session = f"{avenue.spec.id}-configuration-{avenue.rounds + 1}"
+            return self._run_with_admission(
+                admission,
+                avenue.spec,
+                lambda: avenue_workers[avenue.spec.id].run(
+                    root, task, model=model, session_id=session,
+                    allowed_api_providers=avenue.spec.allowed_api_providers,
+                ),
             )
 
         ledger = BudgetLedger(ws.budget_json)
@@ -876,21 +1469,43 @@ Portfolio state (aggregate vectors only):\n{json.dumps(portfolio.to_dict(), defa
                 "refinement not dispatched: agent dollar headroom is exhausted"
             )
 
-        from .candidates import load_candidate, source_sha
+        from .candidates import load_candidate
         for avenue, result, error in completed:
+            root = _avenue_dir(ws, avenue.spec.id)
+            solution = root / "solution.py"
             if error is not None:
-                # Keep the baseline alive; a failed refinement is not a
-                # failure of the already-evaluated avenue.
-                avenue.notes.append(f"refinement failed: {error}")
-                continue
-            solution = _avenue_dir(ws, avenue.spec.id) / "solution.py"
-            if not solution.exists():
-                avenue.notes.append("refinement removed solution.py")
-                continue
-            source = solution.read_text(encoding="utf-8")
+                avenue.record_failure(
+                    "independent-configuration-turn",
+                    [str(error)],
+                    repairable=True,
+                )
+                repaired = self._repair_worker_output(
+                    harness, avenue, resources,
+                    avenue_workers[avenue.spec.id], root, [str(error)]
+                )
+                if repaired is None:
+                    portfolio.write(portfolio_path)
+                    continue
+                _result, source = repaired
+            elif not solution.exists():
+                details = ["independent configuration left no solution.py"]
+                avenue.record_failure(
+                    "independent-configuration-output", details, repairable=True
+                )
+                repaired = self._repair_worker_output(
+                    harness, avenue, resources,
+                    avenue_workers[avenue.spec.id], root, details
+                )
+                if repaired is None:
+                    portfolio.write(portfolio_path)
+                    continue
+                _result, source = repaired
+            else:
+                source = solution.read_text(encoding="utf-8")
             try:
                 source = self._ensure_adherent_solution(
-                    harness, avenue, resources, worker, solution.parent,
+                    harness, avenue, resources,
+                    avenue_workers[avenue.spec.id], root,
                     initial_task=(
                         "Re-implement the function in task.md as a materially "
                         "improved configuration of the exact same non-negotiable "
@@ -901,67 +1516,77 @@ Portfolio state (aggregate vectors only):\n{json.dumps(portfolio.to_dict(), defa
                 portfolio.write(portfolio_path)
                 return
             except Exception as exc:
-                avenue.notes.append(f"refinement adherence review failed: {exc}")
+                avenue.record_blocker(
+                    "refinement-audit-needs-human", [str(exc)]
+                )
+                portfolio.write(portfolio_path)
                 continue
             if source is None:
                 portfolio.write(portfolio_path)
                 continue
             baseline = load_candidate(ws, avenue.candidates[-1])
-            # A second turn that made no code change still counts as an attempted
-            # configuration, but does not spend candidate-eval budget.
-            if source_sha(baseline) == hashlib.sha256(source.encode()).hexdigest():
-                avenue.rounds += 1
-                avenue.no_progress_rounds += 1
-                avenue.notes.append("second configuration made no source change")
-                if avenue.no_progress_rounds >= portfolio.policy.stagnation_rounds:
-                    avenue.status = AvenueStatus.STAGNANT
-                continue
-            try:
-                from .candidates import next_name
-
-                expected_name = next_name(ws)
-                avenue.begin_candidate(expected_name)
-                portfolio.write(portfolio_path)
-                source = _materialize_bundle(
-                    source, solution.parent, ws, avenue.spec.id
+            baseline_source = baseline.source
+            versioned_namespace = f"{avenue.spec.id}-{baseline.name}"
+            baseline_source = baseline_source.replace(
+                f'"{versioned_namespace}"', f'"{avenue.spec.id}"'
+            ).replace(
+                f"'{versioned_namespace}'", f"'{avenue.spec.id}'"
+            )
+            baseline_sha = hashlib.sha256(baseline_source.encode()).hexdigest()
+            baseline_artifacts = _artifact_tree_sha(
+                ws.artifacts_dir / versioned_namespace
+            )
+            current_artifacts = _artifact_tree_sha(
+                root / "artifacts" / avenue.spec.id
+            )
+            if (
+                baseline_sha == hashlib.sha256(source.encode()).hexdigest()
+                and baseline_artifacts == current_artifacts
+            ):
+                details = [
+                    "independent configuration made no material source change; "
+                    "this does not count as a second implementation"
+                ]
+                avenue.record_failure(
+                    "non-independent-configuration", details, repairable=True
                 )
-                cand = harness.new_candidate(source=source)
-                if cand.name != expected_name:
-                    raise RunnerError(
-                        f"Candidate journal expected {expected_name}, got {cand.name}."
-                    )
-                train = harness.eval(cand.name, split="train", per_instance=True)
-                environment_errors = _complete_environment_failure(train)
-                if environment_errors:
+                repaired = self._repair_worker_output(
+                    harness, avenue, resources,
+                    avenue_workers[avenue.spec.id], root, details
+                )
+                if repaired is None:
+                    portfolio.write(portfolio_path)
+                    continue
+                _result, source = repaired
+                current_artifacts = _artifact_tree_sha(
+                    root / "artifacts" / avenue.spec.id
+                )
+                if (
+                    baseline_sha == hashlib.sha256(source.encode()).hexdigest()
+                    and baseline_artifacts == current_artifacts
+                ):
                     avenue.record_blocker(
-                        "candidate-environment-failure", environment_errors,
-                        candidate=cand.name,
+                        "independent-configuration-needs-human", details
                     )
                     portfolio.write(portfolio_path)
                     continue
-                val = harness.eval(cand.name)
-                comparison = harness.compare(baseline.name, cand.name)
-            except BudgetExceededError:
-                portfolio.write(portfolio_path)
-                return
-            except Exception as exc:
-                blocker = _environment_blocker_text(str(exc))
-                if blocker:
-                    avenue.record_blocker("candidate-environment-failure", blocker)
-                else:
-                    avenue.notes.append(f"refined implementation failed: {exc}")
-                continue
-            avenue.record_result(
-                cand.name,
-                {name: float(obj["mean"]) for name, obj in val.objectives.items()},
-                improved=bool(comparison.improved),
+            self._evaluate_solution_bundle(
+                harness,
+                avenue,
+                resources,
+                avenue_workers[avenue.spec.id],
+                root,
+                source,
+                portfolio,
+                portfolio_path,
+                baseline_name=baseline.name,
             )
-            avenue.notes.append(str(comparison))
-            portfolio.write(portfolio_path)
 
-    def _compose_frontier(self, harness, portfolio, resources, worker, portfolio_path) -> None:
+    def _compose_frontier(self, harness, portfolio, resources, _worker, portfolio_path) -> None:
         tradeoffs = harness.tradeoffs()
         if len(tradeoffs.nondominated) < 2:
+            return
+        if any(a.spec.id == "frontier-composition" for a in portfolio.avenues):
             return
         try:
             BudgetLedger(harness.workspace.budget_json).check()
@@ -994,33 +1619,58 @@ Portfolio state (aggregate vectors only):\n{json.dumps(portfolio.to_dict(), defa
                 fh.write(json.dumps(row, default=str) + "\n")
         for i, name in enumerate(names):
             (root / f"component_{i}.py").write_text(load_candidate(harness.workspace, name).source)
-        model = self.worker_model or (
-            resources.search.pi_models[0] if resources.search.pi_models else None
-        )
-        result = worker.run(
-            root,
-            "Build the self-contained composition described in task.md from the supplied component files. Create and syntax-check solution.py.",
-            model=model,
-            session_id=spec.id,
-            allowed_api_providers=tuple(
-                provider for provider in resources.runtime.api_providers
-                if provider in set(resources.search.candidate_api_providers or ())
-            ),
-        )
-        BudgetLedger(harness.workspace.budget_json).charge(
-            dollars=result.usage.dollars, category="agent"
-        )
         from .portfolio import AvenueState
         composed = AvenueState(spec=spec)
+        composition_worker = PiWorkerRunner(
+            self.command,
+            timeout=self.worker_timeout,
+            remote_compute=(
+                resources.search.remote_compute
+                if use_remote_for_avenue(spec)
+                else None
+            ),
+        )
         portfolio.avenues.append(composed)
-        solution = root / "solution.py"
-        if not solution.exists():
-            composed.status = AvenueStatus.FAILED
-            composed.notes.append("composition worker did not create solution.py")
-            return
+        portfolio.write(portfolio_path)
         try:
+            admission = RemoteAdmission(resources.search.remote_compute)
+            self._run_with_admission(
+                admission,
+                spec,
+                lambda: self._charged_worker_turn(
+                    harness.workspace,
+                    resources,
+                    composition_worker,
+                    root,
+                    "Build the self-contained composition described in task.md "
+                    "from the supplied component files. Create and syntax-check "
+                    "solution.py.",
+                    session_id=spec.id,
+                    allowed_api_providers=tuple(
+                        provider for provider in resources.runtime.api_providers
+                        if provider in set(resources.search.candidate_api_providers or ())
+                    ),
+                    model=spec.worker_model,
+                ),
+            )
+            solution = root / "solution.py"
+            if not solution.exists():
+                repaired = self._repair_worker_output(
+                    harness,
+                    composed,
+                    resources,
+                    composition_worker,
+                    root,
+                    ["composition worker did not create solution.py"],
+                )
+                if repaired is None:
+                    portfolio.write(portfolio_path)
+                    return
+                _result, source = repaired
+            else:
+                source = solution.read_text(encoding="utf-8")
             source = self._ensure_adherent_solution(
-                harness, composed, resources, worker, root,
+                harness, composed, resources, composition_worker, root,
                 initial_task=(
                     "Build the explicit composition in task.md from the supplied "
                     "components. Only this composition contract permits cross-family "
@@ -1030,50 +1680,46 @@ Portfolio state (aggregate vectors only):\n{json.dumps(portfolio.to_dict(), defa
             if source is None:
                 portfolio.write(portfolio_path)
                 return
-            from .candidates import next_name
-
-            expected_name = next_name(harness.workspace)
-            composed.begin_candidate(expected_name)
+            self._evaluate_solution_bundle(
+                harness,
+                composed,
+                resources,
+                composition_worker,
+                root,
+                source,
+                portfolio,
+                portfolio_path,
+            )
+        except BudgetExceededError:
             portfolio.write(portfolio_path)
-            source = _materialize_bundle(
-                source, root, harness.workspace, spec.id
-            )
-            cand = harness.new_candidate(source=source)
-            if cand.name != expected_name:
-                raise RunnerError(
-                    f"Candidate journal expected {expected_name}, got {cand.name}."
-                )
-            train = harness.eval(cand.name, split="train", per_instance=True)
-            environment_errors = _complete_environment_failure(train)
-            if environment_errors:
-                composed.record_blocker(
-                    "candidate-environment-failure", environment_errors,
-                    candidate=cand.name,
-                )
-                portfolio.write(portfolio_path)
-                return
-            val = harness.eval(cand.name)
-            composed.record_result(
-                cand.name,
-                {name: float(obj["mean"]) for name, obj in val.objectives.items()},
-                improved=cand.name in harness.tradeoffs().nondominated,
-            )
+            return
         except Exception as exc:
-            blocker = _environment_blocker_text(str(exc))
-            if blocker:
-                composed.record_blocker("candidate-environment-failure", blocker)
-            else:
-                composed.status = AvenueStatus.FAILED
-                composed.notes.append(str(exc))
+            composed.record_blocker(
+                "composition-implementation-needs-human", [str(exc)]
+            )
         portfolio.write(portfolio_path)
 
-    def _orchestrator(self, ws) -> PiRpcClient:
+    def _orchestrator(self, ws, *, web_research: bool = False) -> PiRpcClient:
+        extensions = ()
+        tools = ()
+        if web_research:
+            extensions = (Path(__file__).parent / "pi" / "web-search.ts",)
+            tools = ("web_search", "web_fetch")
         return PiRpcClient(
             self.command,
             cwd=ws.root,
-            model=self.orchestrator_model,
+            model=(
+                self.orchestrator_model
+                or (
+                    self.resources.search.pi_models[0]
+                    if self.resources is not None and self.resources.search.pi_models
+                    else None
+                )
+            ),
             system_prompt=_ORCHESTRATOR_SYSTEM,
             timeout=self.orchestrator_timeout,
+            extensions=extensions,
+            tools=tools,
         )
 
     def _propose_metric_suite(self, harness, resources: Resources) -> bool:
@@ -1109,7 +1755,13 @@ keys in the corrected METRICS mapping. Task schema:\n{harness.schema.describe()}
             with PiRpcClient(
                 self.command,
                 cwd=ws.root,
-                model=self.orchestrator_model,
+                model=(
+                    self.orchestrator_model
+                    or (
+                        resources.search.pi_models[0]
+                        if resources.search.pi_models else None
+                    )
+                ),
                 system_prompt=(
                     "You are an independent evaluation-design critic. You never "
                     "implement the task. Return only requested JSON."
@@ -1161,39 +1813,124 @@ keys in the corrected METRICS mapping. Task schema:\n{harness.schema.describe()}
     def _create_portfolio(self, harness, resources: Resources) -> Portfolio:
         BudgetLedger(harness.workspace.budget_json).check()
         feasibility = resources.feasibility()
-        prompt = f"""Design a diverse task-specific implementation portfolio across
-EVERY feasible tier in the supplied feasibility map. Each avenue must use a
-materially distinct mechanism. Do not write code. Return JSON:
+        prompt = f"""Before designing the portfolio, use web_search at least twice
+with different task-specific queries and inspect current sources for modern
+models, algorithms, libraries, and compound systems. Do not include private
+examples in queries. Then design a diverse task-specific implementation
+portfolio across EVERY feasible tier in the supplied feasibility map. Each
+avenue must use a materially distinct mechanism and cite source URLs in
+`research_sources`. Do not write code. Return JSON:
 {{"avenues": [{{"id":"...", "tier":1, "title":"...",
 "hypothesis":"...", "implementation_brief":"...", "mechanism":"...",
 "runtime_requirements":[], "allowed_api_providers":[],
 "required_capabilities":[], "required_mechanisms":["non-negotiable evidence"],
 "forbidden_substitutions":["specific cross-family fallback"], "max_rounds":3,
-"wildcard":false}}], "exclusions": {{"tier": "reason"}}}}
+"worker_model":"one exact Resources.search.pi_models pattern, or null",
+"wildcard":false, "research_sources":["https://..."]}}],
+"exclusions": {{"tier": "reason"}}}}
 Every avenue is a hard mechanism experiment: missing packages, credentials, GPU,
 models, or network may block it but must never justify another implementation
 family. Specify what must be present and what substitutions are forbidden.
 Schema:\n{harness.schema.describe()}\nResources:\n{json.dumps(resources.to_dict())}\nFeasibility:\n{json.dumps(feasibility)}"""
         try:
-            with self._orchestrator(harness.workspace) as client:
+            with self._orchestrator(harness.workspace, web_research=True) as client:
                 result = client.prompt(prompt)
             BudgetLedger(harness.workspace.budget_json).charge(
                 dollars=result.usage.dollars, category="agent"
             )
+            research = _web_research_records(result)
+            if len(research) < 2:
+                raise RunnerError(
+                    "Pi portfolio planning did not complete the required two "
+                    "current-source web searches. Planning from model memory was "
+                    "refused; fix web access or let the human-facing orchestrator "
+                    "perform prg.web_search(...)."
+                )
+            research_path = harness.workspace.research_json
+            research_path.parent.mkdir(parents=True, exist_ok=True)
+            sources: dict[str, dict] = {}
+            searches = []
+            for item in research:
+                normalized = {
+                    "query": item.get("query", ""),
+                    "searched_at": item.get("searchedAt", ""),
+                    "results": item.get("results", []),
+                }
+                searches.append(normalized)
+                for source in normalized["results"]:
+                    if source.get("url"):
+                        sources[str(source["url"])] = source
+            research_path.write_text(json.dumps({
+                "searches": searches,
+                "sources": list(sources.values()),
+                "updated_at": searches[-1].get("searched_at", ""),
+            }, indent=2) + "\n")
+            from .research import WebResearchError, ensure_researched
+
+            try:
+                ensure_researched(harness.workspace)
+            except WebResearchError as exc:
+                raise RunnerError(str(exc)) from exc
             value = _json_object(result.text)
+            research_urls = [
+                str(source.get("url"))
+                for search in research
+                for source in search.get("results", [])
+                if source.get("url")
+            ]
+            raw_specs = []
+            known_research_urls = set(research_urls)
+            for raw in value.get("avenues", []):
+                item = dict(raw)
+                cited = [
+                    str(url) for url in item.get("research_sources", [])
+                    if str(url) in known_research_urls
+                ]
+                item["research_sources"] = cited or research_urls
+                raw_specs.append(item)
             specs = [
                 ensure_avenue_contract(AvenueSpec.from_dict(v), resources)
-                for v in value.get("avenues", [])
+                for v in raw_specs
             ]
-            return Portfolio.create(
+            portfolio = Portfolio.create(
                 resources,
                 specs,
                 exclusions={int(k): str(v) for k, v in value.get("exclusions", {}).items()},
                 fill_missing=True,
             )
+            from dataclasses import replace
+
+            for avenue in portfolio.avenues:
+                if not avenue.spec.research_sources:
+                    avenue.spec = replace(
+                        avenue.spec, research_sources=tuple(research_urls)
+                    )
+            return portfolio
+        except RunnerError:
+            raise
         except Exception as exc:
-            print(f"[autoprogramming] Pi portfolio plan was invalid ({exc}); filling a deterministic breadth-first portfolio.")
-            return Portfolio.create(resources, [], fill_missing=True)
+            print(
+                f"[autoprogramming] Pi portfolio plan was structurally invalid "
+                f"after web research ({exc}); filling missing tiers with the "
+                "deterministic breadth policy while preserving the research record."
+            )
+            portfolio = Portfolio.create(resources, [], fill_missing=True)
+            try:
+                from dataclasses import replace
+
+                urls = tuple(
+                    str(source.get("url"))
+                    for search in research
+                    for source in search.get("results", [])
+                    if source.get("url")
+                )
+                for avenue in portfolio.avenues:
+                    avenue.spec = replace(
+                        avenue.spec, research_sources=urls
+                    )
+            except Exception:
+                pass
+            return portfolio
 
     def _run_avenue(
         self, harness, spec: AvenueSpec, resources: Resources,
@@ -1232,7 +1969,9 @@ Schema:\n{harness.schema.describe()}\nResources:\n{json.dumps(resources.to_dict(
             "is absent, preserve the mechanism and fail clearly rather than adding "
             "a fallback. Test what the environment permits and syntax-check the file."
         )
-        model = self.worker_model or (resources.search.pi_models[0] if resources.search.pi_models else None)
+        model = self.worker_model or spec.worker_model or (
+            resources.search.pi_models[0] if resources.search.pi_models else None
+        )
         # Probe contents never enter the worker directory or prompt.
         _ = probe_rows
         return worker.run(

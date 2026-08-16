@@ -52,6 +52,77 @@ def test_portfolio_fills_every_feasible_tier():
     }
 
 
+def test_pi_subscription_gets_its_own_measured_avenue_beside_raw_api():
+    profile = ap.Resources(
+        search=ap.SearchResources(
+            pi_models=("openai-codex/gpt-5:max",),
+            candidate_api_providers=("openai",),
+            allow_package_installs=False,
+            allow_model_downloads=False,
+        ),
+        runtime=ap.RuntimeResources(
+            network=True, api_providers=("openai",)
+        ),
+        data=ap.DataPolicy(external_egress=True),
+        confirmed=True,
+    )
+    portfolio = Portfolio.create(profile, [])
+    model_calls = [
+        avenue for avenue in portfolio.avenues
+        if avenue.spec.tier == ApproachTier.SINGLE_MODEL_CALL
+    ]
+    assert any(avenue.spec.allowed_api_providers for avenue in model_calls)
+    pi_avenues = [
+        avenue for avenue in model_calls
+        if any(
+            cap.startswith("pi-model:")
+            for cap in avenue.spec.required_capabilities
+        )
+    ]
+    assert len(pi_avenues) == 1
+    assert pi_avenues[0].spec.allowed_api_providers == ()
+    assert any("subscription" in note for note in pi_avenues[0].spec.deployment_notes)
+
+
+def test_worker_model_must_come_from_discovered_pi_registry():
+    profile = ap.Resources(
+        search=ap.SearchResources(
+            pi_models=("openai-codex/active:max", "openai-codex/strong"),
+            allow_package_installs=False,
+            allow_model_downloads=False,
+        ),
+        runtime=ap.RuntimeResources(network=False),
+        data=ap.DataPolicy(external_egress=True),
+        confirmed=True,
+    )
+    strong = AvenueSpec(
+        id="strong-rules",
+        tier=ApproachTier.CODE_AND_RULES,
+        title="Strong worker",
+        hypothesis="A stronger reasoning worker may engineer better rules.",
+        implementation_brief="Build generalized rules.",
+        mechanism="generalized rule synthesis",
+        worker_model="openai-codex/strong",
+    )
+    portfolio = Portfolio.create(profile, [strong])
+    selected = next(a for a in portfolio.avenues if a.spec.id == "strong-rules")
+    assert selected.spec.worker_model == "openai-codex/strong"
+
+    with pytest.raises(ValueError, match="unavailable Pi worker model"):
+        Portfolio.create(
+            profile,
+            [AvenueSpec(
+                id="unknown-worker",
+                tier=ApproachTier.CODE_AND_RULES,
+                title="Unknown",
+                hypothesis="Test validation.",
+                implementation_brief="Build rules.",
+                mechanism="different rule synthesis",
+                worker_model="other/missing",
+            )],
+        )
+
+
 def test_duplicate_mechanisms_within_tier_refused():
     with pytest.raises(ValueError, match="repeat"):
         Portfolio.create(
@@ -71,22 +142,35 @@ def test_budget_fractions_must_sum_to_one():
         )
 
 
-def test_cannot_finalize_before_breadth_is_attempted():
+def test_broken_implementations_do_not_satisfy_breadth_or_finalize():
     portfolio = Portfolio.create(resources(), [spec()])
     assert portfolio.breadth_complete is False
     assert portfolio.may_finalize is False
     for avenue in portfolio.avenues:
         avenue.status = AvenueStatus.FAILED
     portfolio.avenues[0].record_result("candidate_0", {"quality": 0.5}, improved=True)
+    assert portfolio.breadth_complete is False
+    assert portfolio.may_finalize is False
+
+    # Explicitly unavailable families are conclusive, while the successful
+    # family needs a materially different second configuration.
+    for avenue in portfolio.avenues[1:]:
+        avenue.status = AvenueStatus.INFEASIBLE
+    portfolio.avenues[0].record_result(
+        "candidate_1", {"quality": 0.6}, improved=True
+    )
     assert portfolio.breadth_complete is True
     assert portfolio.may_finalize is True
 
 
 def test_candidate_journal_is_persisted_and_cleared_by_result(tmp_path):
-    portfolio = Portfolio.create(resources(), [spec()])
+    portfolio = Portfolio.create(
+        resources(), [spec()],
+        policy=PortfolioPolicy(min_configs_before_abandon=1),
+    )
     state = next(a for a in portfolio.avenues if a.spec.id == "custom-rules")
     for avenue in portfolio.avenues:
-        avenue.status = AvenueStatus.FAILED
+        avenue.status = AvenueStatus.INFEASIBLE
     state.begin_candidate("candidate_7")
     assert portfolio.breadth_complete is False
     assert portfolio.may_finalize is False
@@ -144,6 +228,17 @@ def test_blocked_avenue_needs_human_resolution_before_breadth(tmp_path):
     assert retried.status == AvenueStatus.PLANNED
     assert retried.blocker is None
     assert retried.human_retry_confirmed is True
+
+
+def test_human_retry_after_one_good_candidate_resumes_same_family_deepening():
+    portfolio = Portfolio.create(resources(), [spec()])
+    state = next(a for a in portfolio.avenues if a.spec.id == "custom-rules")
+    state.record_result("candidate_0", {"quality": 0.5}, improved=True)
+    state.record_blocker("second-config-setup", ["temporary package failure"])
+    portfolio.resolve_blocker("custom-rules", "retry", "human-user")
+    assert state.status == AvenueStatus.EVALUATED
+    assert state.candidates == ["candidate_0"]
+    assert state.human_retry_confirmed is True
 
 
 def test_human_can_confirm_blocked_approach_is_really_unavailable():

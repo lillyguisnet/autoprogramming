@@ -436,6 +436,50 @@ def test_budget_exceeded_in_backend_still_finalizes(tmp_path, monkeypatch):
     assert report.activated == "candidate_0"
 
 
+def test_live_pi_session_uses_human_facing_host_orchestrator(
+    tmp_path, monkeypatch, capsys
+):
+    require_siblings()
+    import importlib
+    program_mod = importlib.import_module("autoprogramming.program")
+    from autoprogramming.pi_backend import PiOrchestratorBackend
+
+    monkeypatch.setenv("PI_SESSION_ID", "host-session")
+    monkeypatch.setenv("PI_PROVIDER", "openai-codex")
+    monkeypatch.setenv("PI_MODEL", "gpt-5.6-sol")
+    monkeypatch.setenv("PI_REASONING_LEVEL", "max")
+    monkeypatch.setattr(program_mod.shutil, "which", lambda name: "/usr/bin/pi")
+    monkeypatch.setattr(
+        PiOrchestratorBackend,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must not spawn a second strategy orchestrator")
+        ),
+    )
+    resources = ap.Resources(
+        search=ap.SearchResources(
+            allow_package_installs=False,
+            allow_model_downloads=False,
+        ),
+        runtime=ap.RuntimeResources(network=False),
+        data=ap.DataPolicy(external_egress=True),
+        confirmed=True,
+    )
+    prg = make_shout()
+    assert prg.optimize(
+        rows_for(5),
+        budget=Budget(eval_calls=10),
+        workspace=tmp_path / "host_ap",
+        resources=resources,
+    ) is None
+    output = capsys.readouterr().out
+    assert "current human-facing Pi session" in output
+    recorded = json.loads(prg.workspace.resources_json.read_text())
+    assert recorded["search"]["pi_models"][0] == (
+        "openai-codex/gpt-5.6-sol:max"
+    )
+
+
 def test_budget_exhaustion_does_not_finalize_incomplete_pi_portfolio(
     tmp_path, monkeypatch
 ):

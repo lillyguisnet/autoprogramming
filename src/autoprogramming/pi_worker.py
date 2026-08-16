@@ -12,8 +12,12 @@ from pathlib import Path
 from .errors import RunnerError
 from .pi_rpc import PiResult, PiUsage, assistant_failure
 from .portfolio import AvenueSpec
-from .resources import Resources
-
+from .remote import (
+    RemoteExecutor,
+    gpu_environment_prefix,
+    use_remote_for_avenue,
+)
+from .resources import RemoteCompute, Resources
 
 WORKER_SYSTEM = """You are the sole implementation engineer for a standalone
 Python function. Your first and non-negotiable obligation is MECHANISM FIDELITY:
@@ -24,10 +28,15 @@ approach is a failure, even if it avoids an exception or appears more reliable.
 NEVER replace the assigned mechanism because a package, model, API credential,
 GPU, network service, or other capability is missing in your authoring shell.
 Third-party packages need not already be installed: declare them in the PEP 723
-block so the execution controller can resolve them. If an assigned capability
-really cannot be exercised locally, still implement it faithfully, syntax-check
-what you can, and make the runtime fail clearly with a precise setup error. Do
-not add classical ML, classical CV, rules, regex, lookup, local-model, or API
+block so the execution controller can resolve them. Pi model access is different
+from a raw SDK key: when task.md lists an authenticated Pi model, the local Pi
+CLI resolves its stored OAuth/subscription login itself. Do not reject that
+capability merely because OPENAI_API_KEY/ANTHROPIC_API_KEY is absent; use Pi's
+CLI/RPC runtime for the implementation when assigned and declare
+`pi_runtime = true` under `[tool.ap]`. If an assigned capability
+really cannot be exercised, still implement it faithfully, syntax-check what
+you can, and make the runtime fail clearly with a precise setup error. Do not
+add classical ML, classical CV, rules, regex, lookup, local-model, or API
 fallbacks from another approach family. Retries, parsing, preprocessing, and
 error handling are welcome only when the assigned mechanism remains the path
 that produces the answer. Cross-family routing is allowed solely when task.md
@@ -49,9 +58,16 @@ error branch substitutes a different mechanism and syntax-checking solution.py.
 class PiWorkerRunner:
     """Run one implementation-only Pi worker in an isolated context."""
 
-    def __init__(self, command: tuple[str, ...] = ("pi",), timeout: float = 1200.0):
+    def __init__(
+        self,
+        command: tuple[str, ...] = ("pi",),
+        timeout: float = 1200.0,
+        *,
+        remote_compute: RemoteCompute | None = None,
+    ):
         self.command = tuple(command)
         self.timeout = timeout
+        self.remote_compute = remote_compute
 
     def run(
         self,
@@ -62,6 +78,14 @@ class PiWorkerRunner:
         session_id: str | None = None,
         allowed_api_providers: tuple[str, ...] = (),
     ) -> PiResult:
+        remote_executor = (
+            RemoteExecutor(self.remote_compute) if self.remote_compute else None
+        )
+        remote_root = None
+        if remote_executor is not None:
+            remote_root = remote_executor.staged_dir(cwd, namespace=cwd.name)
+            remote_executor.sync_to(cwd, remote_root)
+
         guard_source = Path(__file__).parent / "pi" / "worker-guard.ts"
         guard = cwd / ".tools" / "root-guard.ts"
         guard.parent.mkdir(exist_ok=True)
@@ -75,15 +99,28 @@ class PiWorkerRunner:
             "--tools", "read,bash,edit,write",
             "--system-prompt", WORKER_SYSTEM,
         ]
+        if remote_executor is not None:
+            remote_source = Path(__file__).parent / "pi" / "remote-worker.ts"
+            remote_extension = cwd / ".tools" / "remote-worker.ts"
+            shutil.copyfile(remote_source, remote_extension)
+            args.extend(("--extension", str(remote_extension)))
         if session_id:
             session_dir = cwd / ".pi-sessions"
             session_dir.mkdir(exist_ok=True)
             args.extend(("--session-dir", str(session_dir), "--session-id", session_id))
         else:
             args.append("--no-session")
+        model = model or inherited_pi_model()
         if model:
             args.extend(("--model", model))
         args.append(task)
+        env = worker_env(allowed_api_providers, pi_model=model)
+        if remote_executor is not None:
+            env["AP_REMOTE_ENDPOINT"] = self.remote_compute.endpoint
+            env["AP_REMOTE_CWD"] = str(remote_root)
+            env["AP_REMOTE_ENV_PREFIX"] = gpu_environment_prefix(
+                self.remote_compute
+            )
         try:
             proc = subprocess.run(
                 args,
@@ -92,10 +129,7 @@ class PiWorkerRunner:
                 capture_output=True,
                 timeout=self.timeout,
                 check=False,
-                env=worker_env(
-                    allowed_api_providers,
-                    pi_model=model,
-                ),
+                env=env,
             )
         except FileNotFoundError as exc:
             raise RunnerError(
@@ -105,6 +139,11 @@ class PiWorkerRunner:
             raise RunnerError(
                 f"Pi implementation worker timed out after {self.timeout:g}s."
             ) from exc
+        finally:
+            if remote_executor is not None and remote_root is not None:
+                # Retrieve even a partial solution: the controller will audit it
+                # and can ask the same approach worker to repair it.
+                remote_executor.sync_from(remote_root, cwd)
 
         messages: list[dict] = []
         usage = PiUsage()
@@ -145,6 +184,19 @@ class PiWorkerRunner:
         )
 
 
+def inherited_pi_model() -> str | None:
+    """Exact provider/model/thinking selected in the human-facing Pi session."""
+    provider = os.environ.get("PI_PROVIDER", "").strip()
+    model = os.environ.get("PI_MODEL", "").strip()
+    if not provider or not model:
+        return None
+    result = f"{provider}/{model}"
+    thinking = os.environ.get("PI_REASONING_LEVEL", "").strip().lower()
+    if thinking:
+        result += f":{thinking}"
+    return result
+
+
 _PROVIDER_ENV_MARKERS = {
     "anthropic": ("ANTHROPIC_", "ANT_LING_"),
     "openai": ("OPENAI_", "AZURE_OPENAI_"),
@@ -157,6 +209,10 @@ _PROVIDER_ENV_MARKERS = {
     "deepseek": ("DEEPSEEK_",),
     "xai": ("XAI_",),
     "aws": ("AWS_",),
+    "github": ("GITHUB_", "GH_",),
+    "github-copilot": ("GITHUB_", "GH_", "COPILOT_"),
+    "openai-codex": ("OPENAI_CODEX_", "CODEX_", "CHATGPT_"),
+    "claude-code": ("CLAUDE_CODE_",),
 }
 
 
@@ -193,11 +249,13 @@ def worker_env(
             key == "AP_WORKSPACE"
             or key.startswith("AUTOPROGRAMMING_")
             or key == "PYTHONPATH"
+            or key in ("PI_SESSION_ID", "PI_SESSION_FILE")
         ):
             continue
         credential_like = (
-            key.endswith("_API_KEY")
-            or key.endswith("_OAUTH_TOKEN")
+            key.endswith((
+                "_API_KEY", "_OAUTH_TOKEN", "_TOKEN", "_SECRET", "_PASSWORD"
+            ))
             or key
             in (
                 "AWS_SECRET_ACCESS_KEY",
@@ -270,6 +328,26 @@ def task_document(schema, spec: AvenueSpec, resources: Resources) -> str:
     search_resources["available_runtime_api_access"] = (
         resources.search.candidate_api_providers
     )
+    search_resources["authenticated_pi_models"] = resources.search.pi_models
+    supplied_remote = resources.search.remote_compute
+    remote = (
+        supplied_remote
+        if supplied_remote is not None and use_remote_for_avenue(spec)
+        else None
+    )
+    search_resources["remote_compute_available"] = supplied_remote is not None
+    search_resources["remote_compute_provided"] = remote is not None
+    if remote is not None:
+        search_resources["effective_compute_location"] = "user-provided remote target"
+        search_resources["effective_remote_compute"] = {
+            "cpu_cores": remote.cpu_cores,
+            "memory_gb": remote.memory_gb,
+            "disk_gb": remote.disk_gb,
+            "gpu": remote.gpu,
+            "gpu_vram_gb": remote.gpu_vram_gb,
+            "max_parallel_gpu_jobs": remote.max_parallel_gpu_jobs,
+            "min_free_gpu_vram_gb": remote.min_free_gpu_vram_gb,
+        }
     return f"""# Implementation task
 
 ## Goal
@@ -301,12 +379,33 @@ clear setup/runtime failure, never a substitute implementation.
 ## Available build/search resources
 {json.dumps(search_resources, default=str, indent=2)}
 
+Declare placement facts under `[tool.ap]`: set `network_required = true` and
+`api_providers = ["..."]` for a network/provider runtime; set `pi_runtime =
+true` for Pi; and set `compute_heavy = true` for training, large local models,
+or compute-heavy inference (`false` for genuinely lightweight code). These are
+capability metadata, never credentials.
+
 Packages declared in solution.py's PEP 723 block are resolved by the execution
 controller. Their absence from the current shell is not a reason to avoid them.
+When `remote_compute_provided` is true, your file and shell tools already operate
+on that user-provided target. Treat `effective_remote_compute` as the available
+build machine; do not reject an avenue because the host computer is smaller and
+do not route heavy work back to the host.
 
 ## Permitted runtime resources
 {json.dumps(resources.runtime.__dict__, default=str, indent=2)}
 Allowed API providers for this implementation: {list(spec.allowed_api_providers)}
+Authenticated Pi models available without raw SDK keys: {list(resources.search.pi_models)}
+Deployment notes: {list(spec.deployment_notes)}
+
+When this contract names a `pi-model:` capability, implement model calls through
+Pi (`pi --mode rpc` or another persistent Pi CLI/SDK integration), and declare
+`pi_runtime = true` under `[tool.ap]`. Pi reads the user's stored
+OAuth/subscription login. The absence of an `*_API_KEY` environment variable is
+not evidence that this capability is unavailable. Report Pi usage cost from its
+JSON events and load the Pi process lazily. The controller evaluates this
+network-bound point beside the authenticated host even when heavy compute is
+staged remotely; it never copies OAuth credentials to the compute target.
 
 ## Runtime artifact namespace
 If runtime files are needed, use `artifacts/{spec.id}/` here and declare

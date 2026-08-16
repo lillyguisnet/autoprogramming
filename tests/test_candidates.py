@@ -123,6 +123,10 @@ def test_candidate_tool_ap_properties(tmp_path):
         "# [tool.ap]\n"
         "# deterministic = true\n"
         "# cost_per_call = 0.001\n"
+        "# pi_runtime = true\n"
+        "# network_required = true\n"
+        "# compute_heavy = false\n"
+        '# api_providers = ["openai-codex"]\n'
         '# fetch = ["huggingface:Helsinki-NLP/opus-mt-en-fr"]\n'
         "# ///\n"
         "def predict(text):\n    return text\n"
@@ -131,6 +135,10 @@ def test_candidate_tool_ap_properties(tmp_path):
     cand = load_candidate(ws, "candidate_0")
     assert cand.deterministic is True
     assert cand.cost_per_call == 0.001
+    assert cand.pi_runtime is True
+    assert cand.network_required is True
+    assert cand.compute_heavy is False
+    assert cand.api_providers == ("openai-codex",)
     assert cand.fetch == ("huggingface:Helsinki-NLP/opus-mt-en-fr",)
     assert cand.dependencies == ("transformers>=4.40",)
 

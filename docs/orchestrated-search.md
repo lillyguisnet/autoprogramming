@@ -4,10 +4,12 @@ Status: initial implementation, July 2026.
 
 ## Decision
 
-The optimizer agent is a strategy orchestrator. It does not write candidate
-implementations. A trusted Python controller dispatches independent Pi workers,
-one implementation avenue per isolated context, evaluates their solution
-bundles, and returns only aggregate objective vectors to the orchestrator.
+The Pi model already speaking with the human is the strategy orchestrator. It
+does not write candidate implementations, and a live session never spawns a
+second strategy process. A trusted Python controller dispatches independent Pi
+workers, one implementation avenue per isolated context, evaluates their
+solution bundles, and returns aggregate vectors plus sanitized implementation,
+audit, setup, and failure evidence to that same host session.
 
 This replaces prompt-only encouragement to "try diverse approaches" with a
 controller-enforced breadth policy.
@@ -18,7 +20,7 @@ controller-enforced breadth policy.
 |---|---|---|
 | User | resource proposal, metric demonstrations, final report | hidden rows |
 | Python controller | all run state, expected outputs, metrics, budget | n/a |
-| Pi orchestrator | schema, confirmed resources, portfolio state, aggregate vectors | hidden rows; implementation tools |
+| Human-facing Pi host orchestrator | conversation, schema, confirmed resources, web research, portfolio state, aggregate vectors and implementation diagnostics | hidden rows; candidate-authoring tools |
 | Pi mechanism auditor | one avenue contract and its proposed source/dependency metadata | examples, metrics, scores, other candidates, val/test |
 | Pi implementation worker | generic task brief, development examples, its own files and assigned mechanism | optimizer identity, metrics, scores, other workers, parent workspace, val/test |
 | Candidate runtime | one input at a time, schema/runtime artifacts | expected val/test outputs |
@@ -41,12 +43,23 @@ sandboxing.
 3. `DataPolicy`: whether task data may leave the machine and to which domains.
 
 Hardware may be detected. Egress, network, downloads, package installation, and
-candidate-evaluation API access are never inferred as consent. Runtime API
-permission and usable search-time provider access are separate facts. If egress
-is forbidden, Pi must be explicitly
-confirmed local because worker tool results include task context and examples in
-model requests. Profiles contain provider names and capability limits, never
-credentials.
+remote compute are never inferred as consent. If a user supplies
+`RemoteCompute`, they explicitly select its transport (the built-in adapter is
+SSH); lightweight orchestration/bookkeeping stays local while heavy worker
+commands, setup/training/model loads, and candidate evaluation are staged on the
+target. Pi-runtime candidates remain beside the authenticated host (they are
+network-bound and OAuth is never copied remotely). GPU-heavy avenues hold
+per-target leases (one by default), use a configurable free-VRAM floor (80% when
+total VRAM is supplied and no floor is chosen), and queue
+rather than contend. OOM caused by contention is retried exclusively and is not
+approach evidence.
+
+The active Pi provider/model/thinking tuple may be detected as a capability. Pi
+resolves stored OAuth/subscription authentication itself; raw API-key variables
+are not required. Pi-backed runtime candidates remain in the measured portfolio
+and are labelled as requiring Pi plus an authenticated subscription, allowing
+the user to decide whether that deployment restriction is acceptable. Profiles
+contain model/provider names and capability limits, never credentials.
 
 A dollar-limited run serializes Pi calls when no per-call agent bound is known.
 If `SearchResources.max_dollars_per_agent_call` is confirmed, the controller
@@ -69,19 +82,22 @@ The controller tracks eight tiers:
 7. algorithms, features, and rules
 8. cross-tier composition
 
-Every feasible tier must be attempted or carry an explicit infeasibility reason.
-Each avenue is a hard mechanism experiment: workers may not replace a blocked
-API/deep/classical/rules mechanism with another family merely to return a valid
-answer. Dependencies are resolved from PEP 723 rather than inferred from the
-worker's current environment. Before candidate import, deterministic source
-checks and an independent Pi mechanism audit reject cross-tier fallbacks; the
-controller requests bounded in-session repairs and then clean-session restarts.
-Rejected source is never evaluated under that avenue.
+Every feasible tier must produce faithful evaluated evidence or carry a
+human-confirmed infeasibility reason. Each avenue is a hard mechanism experiment:
+workers may not replace a blocked API/deep/classical/rules mechanism with another
+family merely to return a valid answer. The implementation plan within that
+boundary is flexible—dependency/model variants, setup, batching, preprocessing,
+parsing, and device placement should adapt when the first plan hits a wall.
+Dependencies are resolved from PEP 723 rather than inferred from the shell.
 
-Default budget allocation is 40% breadth, 40% deepening, and 20%
-composition/wildcards. A family receives two materially different engineering
-passes before it is abandoned unless it hard-fails. After breadth, the main Pi
-orchestrator allocates remaining deepening from aggregate objective vectors.
+Before import, deterministic checks and an independent Pi mechanism audit reject
+cross-tier fallbacks. Worker crashes, missing/malformed files, noncompliance,
+all-run errors, and suspicious zero outputs are recorded as implementation
+evidence and trigger bounded repair plus a fresh independent configuration.
+`FAILED` and `NONCOMPLIANT` do not satisfy breadth. After those attempts,
+ambiguous implementation/environment failures become human blockers rather than
+family exclusions. Default budget allocation remains 40% breadth, 40% deepening,
+and 20% composition/wildcards.
 
 Workers use persistent Pi session IDs per avenue, but their only durable task
 context is their isolated directory and their own prior implementation.
@@ -122,24 +138,26 @@ framing and usage collection, `pi_worker.py` owns implementation task bundles,
 environment scrubbing, and worker process launch, while `pi_backend.py` is the
 trusted portfolio controller.
 
-Python uses Pi's documented process APIs:
+Inside a live Pi conversation, Python does not launch strategy RPC at all. The
+host uses `prg.web_search`, `plan_portfolio`, `orchestrate_portfolio`, and
+`portfolio_status` across turns. Python uses Pi's documented process APIs for:
 
-- strategy-only `--mode rpc` calls with no built-in tools or discovered project
-  resources, including independent source-vs-mechanism adherence reviews;
+- independent source-vs-mechanism and suspicious-implementation reviews;
 - parallel `--mode json --print` implementation workers with skills, context,
-  prompts, themes, and user extensions disabled;
+  prompts, themes, and user extensions disabled; workers default to the exact
+  host Pi model/thinking level or use a host-assigned discovered registry model,
+  always through Pi's stored OAuth login;
 - an explicitly loaded root-guard extension;
 - per-avenue session IDs and session directories;
 - assistant usage/cost collected from Pi message events and charged to the same
   dollar ledger as candidate evaluation.
 
-The Python controller validates all JSON plans, fills missing feasible tiers,
-serializes candidate import/evaluation, propagates abort/failure state, and owns
-finalization. `PiOrchestratorBackend` can pin orchestrator/worker model patterns
-(including Pi thinking suffixes such as `:low`) and separate process timeouts, so
-unattended runs need not inherit an unexpectedly expensive or slow global model
-configuration. Terminal provider errors are rejected even when Pi itself exits
-with status zero.
+The Python controller validates host-authored JSON plans, fills missing feasible
+tiers, schedules remote/GPU work, serializes candidate import/evaluation,
+propagates abort/failure state, and leaves finalization to the host after it has
+inspected evidence. An explicitly headless `PiOrchestratorBackend` remains
+available and is web-enabled before planning. Terminal provider errors are
+rejected even when Pi itself exits with status zero.
 
 ### Live integration validation
 
@@ -166,13 +184,13 @@ reference them.
 
 ## Human confirmation for blocked approaches
 
-A preflight failure or an all-run environmental failure marks an avenue
-`blocked`, which does not satisfy portfolio breadth. The controller pauses and
-shows the missing capability instead of accepting fallback code or silently
-excluding the family. A human may fix/provision it and choose `retry`, or may
-explicitly confirm `exclude`, via `prg.resolve_blocker(...)`. The decision and
-approver are persisted in portfolio state. A retry bypasses one stale preflight
-snapshot so newly provisioned hardware/access can be exercised.
+Only after implementation diagnosis, bounded same-family repair, an independent
+configuration, and resource verification does an unresolved failure become
+`blocked`; it never satisfies breadth. The controller shows the evidence instead
+of accepting fallback code or silently excluding the family. A human may
+fix/provision it and choose `retry`, or explicitly confirm `exclude`, via
+`prg.resolve_blocker(...)`. The decision and approver are persisted. A retry
+bypasses one stale preflight snapshot so newly provisioned access can be tested.
 
 ## User flow
 
@@ -180,17 +198,15 @@ snapshot so newly provisioned hardware/access can be exercised.
 resources = ap.Resources(
     search=ap.SearchResources(
         max_parallel_agents=4,
-        pi_local=True,  # or permit external egress for a remote Pi provider
-        candidate_api_providers=("openai",),  # usable during candidate evaluation
+        # Active Pi subscription model is captured from the host session.
+        candidate_api_providers=(),
+        # only if supplied: ap.RemoteCompute(endpoint=..., transport="ssh", ...),
+        # with transport explicitly confirmed rather than assumed,
         allow_package_installs=True,
         allow_model_downloads=True,
     ),
-    runtime=ap.RuntimeResources(
-        network=True,
-        api_providers=("openai",),
-        max_dollars_per_call=0.002,
-    ),
-    data=ap.DataPolicy(external_egress=False),
+    runtime=ap.RuntimeResources(network=False),
+    data=ap.DataPolicy(external_egress=True),
     confirmed=True,
 )
 
@@ -199,14 +215,21 @@ prepared = translate.prepare(
     resources=resources,
     budget=ap.Budget(dollars=2),
 )
-prepared.show_metric_suite()
-prepared.demonstrate_metrics([...])
-prepared.approve_metrics("user")
-report = prepared.optimize(ap.Budget(dollars=20))
+prg = ap.attach(prepared.workspace.root)
+# Current host proposes/demonstrates/approves metrics with the user.
+prg.web_search("latest efficient approaches for <abstract task>")
+prg.web_search("2026 open source <task> benchmark")
+prg.plan_portfolio(web_informed_avenue_specs)
+prg.orchestrate_portfolio("breadth", budget=ap.Budget(dollars=20))
+state = prg.portfolio_status()
+prg.orchestrate_portfolio("deepen", avenue_ids=[...])
+prg.orchestrate_portfolio("compose")
+report = prg.finalize()
 ```
 
-`prepare()` fixes the data split and asks Pi for a multi-lens proposal but does
-not dispatch implementation workers. Search resumes only after sign-off.
+`prepare()` fixes the data split. In a live Pi session the current host proposes
+the multi-lens suite and keeps all strategy context; no second orchestrator is
+created. Search resumes only after sign-off and recorded web research.
 
 ## Remaining hardening
 

@@ -21,6 +21,7 @@ from autoprogramming.pi_backend import (
     _materialize_bundle,
     _normalize_metric_suite_proposal,
     _task_document,
+    _worker_env,
 )
 from autoprogramming import metric
 from autoprogramming.budget import Budget, BudgetLedger
@@ -56,7 +57,7 @@ def fake_pi(tmp_path: Path) -> Path:
         "    print(json.dumps({'type':'agent_settled'}), flush=True)\n"
         "else:\n"
         "  pathlib.Path('solution.py').write_text('def predict(text):\\n    return text\\n')\n"
-        "  pathlib.Path('invocation.json').write_text(json.dumps({'argv':args,'cwd':os.getcwd(),'ap':os.environ.get('AP_WORKSPACE'),'openai':os.environ.get('OPENAI_API_KEY'),'groq':os.environ.get('GROQ_API_KEY')}))\n"
+        "  pathlib.Path('invocation.json').write_text(json.dumps({'argv':args,'cwd':os.getcwd(),'ap':os.environ.get('AP_WORKSPACE'),'openai':os.environ.get('OPENAI_API_KEY'),'groq':os.environ.get('GROQ_API_KEY'),'remote':os.environ.get('AP_REMOTE_ENDPOINT'),'remote_cwd':os.environ.get('AP_REMOTE_CWD')}))\n"
         "  message = {'role':'assistant','content':[{'type':'text','text':'implemented'}],"
         "'usage':{'input':3,'output':4,'cacheRead':0,'cacheWrite':0,'cost':{'total':0.005}},'stopReason':'stop'}\n"
         "  print(json.dumps({'type':'message_end','message':message}))\n"
@@ -178,6 +179,34 @@ def test_worker_rejects_provider_error_with_zero_process_exit(tmp_path):
         PiWorkerRunner(command=(str(exe),)).run(work, "implement")
 
 
+def test_worker_environment_scrubs_host_session_and_unapproved_tokens(monkeypatch):
+    monkeypatch.setenv("PI_SESSION_ID", "private-host-session")
+    monkeypatch.setenv("PI_SESSION_FILE", "/private/session.jsonl")
+    monkeypatch.setenv("GITHUB_TOKEN", "secret")
+    monkeypatch.setenv("OPENAI_CODEX_OAUTH_TOKEN", "pi-authorized")
+    env = _worker_env((), pi_model="openai-codex/gpt-5:max")
+    assert "PI_SESSION_ID" not in env
+    assert "PI_SESSION_FILE" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert env["OPENAI_CODEX_OAUTH_TOKEN"] == "pi-authorized"
+
+
+def test_worker_inherits_host_pi_subscription_model_without_api_key(tmp_path, monkeypatch):
+    exe = fake_pi(tmp_path)
+    work = tmp_path / "subscription-task"
+    work.mkdir()
+    monkeypatch.setenv("PI_PROVIDER", "openai-codex")
+    monkeypatch.setenv("PI_MODEL", "gpt-5.6-sol")
+    monkeypatch.setenv("PI_REASONING_LEVEL", "max")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    PiWorkerRunner(command=(str(exe),)).run(work, "implement")
+    invocation = json.loads((work / "invocation.json").read_text())
+    argv = invocation["argv"]
+    model_at = argv.index("--model")
+    assert argv[model_at + 1] == "openai-codex/gpt-5.6-sol:max"
+    assert invocation["openai"] is None
+
+
 def test_worker_uses_isolated_discovery_flags_and_scrubs_workspace(tmp_path, monkeypatch):
     exe = fake_pi(tmp_path)
     work = tmp_path / "task"
@@ -203,6 +232,41 @@ def test_worker_uses_isolated_discovery_flags_and_scrubs_workspace(tmp_path, mon
     assert "--extension" in argv  # explicit cooperative root guard still loads
     assert "--session-id" in argv
     assert (work / "solution.py").exists()
+
+
+def test_worker_uses_remote_tools_only_when_user_provides_target(
+    tmp_path, monkeypatch
+):
+    import autoprogramming as ap
+
+    exe = fake_pi(tmp_path)
+    work = tmp_path / "remote-task"
+    work.mkdir()
+
+    class FakeRemote:
+        def __init__(self, config):
+            self.config = config
+        def staged_dir(self, *_args, **_kwargs):
+            return "/remote/ap/task"
+        def sync_to(self, *_args, **_kwargs):
+            return None
+        def sync_from(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr("autoprogramming.pi_worker.RemoteExecutor", FakeRemote)
+    target = ap.RemoteCompute(endpoint="gpu-box", transport="ssh", workdir="/remote/ap")
+    PiWorkerRunner(
+        command=(str(exe),), remote_compute=target
+    ).run(work, "implement")
+    invocation = json.loads((work / "invocation.json").read_text())
+    assert invocation["remote"] == "gpu-box"
+    assert invocation["remote_cwd"] == "/remote/ap/task"
+    extensions = [
+        invocation["argv"][i + 1]
+        for i, arg in enumerate(invocation["argv"][:-1])
+        if arg == "--extension"
+    ]
+    assert any(path.endswith("remote-worker.ts") for path in extensions)
 
 
 def test_bundle_import_replaces_orphan_from_pre_candidate_crash(tmp_path):
@@ -275,6 +339,30 @@ def test_controller_recovers_scored_pending_candidate_without_duplication(tmp_pa
     assert state.rounds == 1
     assert "recovered" in state.notes[-1]
     assert len(list(workspace.candidates_dir.glob("candidate_*.py"))) == 1
+
+
+def test_pi_subscription_avenue_tells_worker_not_to_require_raw_key():
+    import autoprogramming as ap
+
+    resources = ap.Resources(
+        search=ap.SearchResources(
+            pi_models=("openai-codex/gpt-5.6-sol:max",),
+            candidate_api_providers=(),
+            allow_package_installs=False,
+            allow_model_downloads=False,
+        ),
+        runtime=ap.RuntimeResources(network=False),
+        data=ap.DataPolicy(external_egress=True),
+        confirmed=True,
+    )
+    brief = _task_document(
+        Schema.from_function(pi_solve),
+        default_avenue(ApproachTier.SINGLE_MODEL_CALL, resources),
+        resources,
+    )
+    assert "authenticated pi models" in brief.lower()
+    assert "absence of an `*_API_KEY`" in brief
+    assert "openai-codex/gpt-5.6-sol:max" in brief
 
 
 def test_worker_brief_contains_no_optimizer_or_metric_context():

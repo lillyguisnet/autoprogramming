@@ -24,11 +24,20 @@ from .errors import (
     WorkspaceError,
 )
 from .harness import attach
+from .host_backend import HostOrchestratorBackend
 from .objectives import MetricSuite, SelectionPolicy, approve_suite
 from .pi_backend import PiOrchestratorBackend
 from .portfolio import ApproachTier, AvenueSpec, PortfolioPolicy
 from .program import PreparedRun, Program, program
-from .resources import DataPolicy, ResourceError, Resources, RuntimeResources, SearchResources
+from .research import SearchReport, SearchResult, WebResearchError
+from .resources import (
+    DataPolicy,
+    RemoteCompute,
+    ResourceError,
+    Resources,
+    RuntimeResources,
+    SearchResources,
+)
 
 try:
     __version__ = _dist_version("autoprogramming")
@@ -43,6 +52,7 @@ __all__ = [
     "attach",
     "Resources",
     "SearchResources",
+    "RemoteCompute",
     "RuntimeResources",
     "DataPolicy",
     "ResourceError",
@@ -53,6 +63,10 @@ __all__ = [
     "AvenueSpec",
     "PortfolioPolicy",
     "PiOrchestratorBackend",
+    "HostOrchestratorBackend",
+    "SearchReport",
+    "SearchResult",
+    "WebResearchError",
     "AutoProgrammingError",
     "SchemaError",
     "DataDisciplineError",

@@ -95,6 +95,34 @@ def predict(image):
     assert deterministic_audit(spec, source).adherent is True
 
 
+def test_pi_runtime_candidate_must_declare_oauth_bound_placement():
+    resources = ap.Resources(
+        search=ap.SearchResources(pi_models=("openai-codex/gpt-5",)),
+        runtime=ap.RuntimeResources(network=True),
+        data=ap.DataPolicy(external_egress=True),
+        confirmed=True,
+    )
+    spec = default_avenue(ApproachTier.SINGLE_MODEL_CALL, resources)
+    source = '''
+import subprocess
+
+def predict(text):
+    return subprocess.check_output(["pi", "--mode", "json", text])
+'''
+    assert deterministic_audit(spec, source).adherent is False
+    declared = '''
+# /// script
+# [tool.ap]
+# pi_runtime = true
+# ///
+import subprocess
+
+def predict(text):
+    return subprocess.check_output(["pi", "--mode", "json", text])
+'''
+    assert deterministic_audit(spec, declared).adherent is True
+
+
 def test_api_capability_is_preflighted_instead_of_left_to_worker_fallback():
     resources = api_resources(available=False)
     # Construct directly because resource feasibility correctly excludes this
@@ -102,6 +130,33 @@ def test_api_capability_is_preflighted_instead_of_left_to_worker_fallback():
     spec = default_avenue(ApproachTier.SINGLE_MODEL_CALL, api_resources())
     missing = _missing_avenue_capabilities(spec, resources)
     assert any("provider access" in item for item in missing)
+
+
+def test_pi_preflight_checks_the_assigned_registry_model_exactly(monkeypatch):
+    monkeypatch.setattr(
+        "autoprogramming.pi_backend.shutil.which", lambda _name: "/usr/bin/pi"
+    )
+    resources = ap.Resources(
+        search=ap.SearchResources(
+            pi_models=("openai-codex/available:max",),
+            allow_package_installs=False,
+            allow_model_downloads=False,
+        ),
+        runtime=ap.RuntimeResources(network=False),
+        data=ap.DataPolicy(external_egress=True),
+        confirmed=True,
+    )
+    spec = default_avenue(ApproachTier.SINGLE_MODEL_CALL, resources)
+    from dataclasses import replace
+
+    spec = replace(
+        spec,
+        required_capabilities=("pi-model:openai-codex/missing:max",),
+    )
+    assert any(
+        "not in the confirmed" in item
+        for item in _missing_avenue_capabilities(spec, resources)
+    )
 
 
 def test_complete_environment_failure_requires_every_run_to_fail():

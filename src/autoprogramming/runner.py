@@ -18,13 +18,15 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import queue
 import re
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
-import threading
 import textwrap
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -32,6 +34,12 @@ from pathlib import Path
 
 from .candidates import Candidate, pep503_normalize, runtime_deps
 from .errors import RunnerError
+from .remote import (
+    RemoteExecutor,
+    candidate_placement,
+    gpu_environment_prefix,
+    load_remote_compute,
+)
 
 DEFAULT_TIMEOUT = 120.0
 STDERR_TAIL = 2000
@@ -195,6 +203,99 @@ for _line in sys.stdin:
     with open(temp_result_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
     os.replace(temp_result_path, result_path)
+'''
+
+
+_REMOTE_SESSION_DRIVER_BODY = r'''
+import contextlib
+import importlib.util
+import io
+import json
+import math
+import sys
+import time
+import traceback
+
+sys.path.insert(0, _PARENT_DIR)
+_BASES = {
+    "bool": bool, "int": int, "float": float, "complex": complex,
+    "str": str, "bytes": bytes, "list": list, "tuple": tuple,
+    "dict": dict, "set": set, "frozenset": frozenset,
+}
+
+
+def _load_candidate():
+    spec = importlib.util.spec_from_file_location("_ap_candidate", _CANDIDATE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_ap_candidate"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _map_outputs(value):
+    names = [f["name"] for f in _OUTPUT_SPEC]
+    if isinstance(value, dict):
+        missing = [n for n in names if n not in value]
+        if missing:
+            raise ValueError("predict() returned a dict missing outputs: " + repr(missing))
+        mapped = {n: value[n] for n in names}
+    elif len(names) == 1:
+        mapped = {names[0]: value}
+    elif isinstance(value, (tuple, list)) and len(value) == len(names):
+        mapped = dict(zip(names, value))
+    else:
+        raise ValueError("predict() returned the wrong output shape: " + repr(value))
+    return {
+        f["name"]: (
+            mapped[f["name"]]
+            if type(mapped[f["name"]]) is _BASES[f["base"]]
+            else _BASES[f["base"]](mapped[f["name"]])
+        )
+        for f in _OUTPUT_SPEC
+    }
+
+
+_import_stdout, _import_stderr = io.StringIO(), io.StringIO()
+try:
+    with contextlib.redirect_stdout(_import_stdout), contextlib.redirect_stderr(_import_stderr):
+        _MODULE = _load_candidate()
+    _IMPORT_ERROR = None
+except Exception:
+    _MODULE = None
+    _IMPORT_ERROR = traceback.format_exc()
+
+for _line in sys.stdin:
+    try:
+        request = json.loads(_line)
+    except Exception:
+        continue
+    if request.get("stop"):
+        break
+    token = request.get("token")
+    started = time.monotonic()
+    captured_out, captured_err = io.StringIO(), io.StringIO()
+    if _IMPORT_ERROR is not None:
+        payload = {"ok": False, "error": _IMPORT_ERROR}
+    else:
+        try:
+            with contextlib.redirect_stdout(captured_out), contextlib.redirect_stderr(captured_err):
+                outputs = _map_outputs(_MODULE.predict(**request["inputs"]))
+            cost = getattr(_MODULE, "AP_COST_DOLLARS", None)
+            if cost is not None:
+                try:
+                    cost = float(cost)
+                    if not math.isfinite(cost) or cost < 0:
+                        cost = None
+                except (TypeError, ValueError):
+                    cost = None
+            payload = {"ok": True, "outputs": outputs, "cost_dollars": cost}
+        except Exception:
+            payload = {"ok": False, "error": traceback.format_exc()}
+    payload["duration_s"] = time.monotonic() - started
+    payload["stdout"] = _import_stdout.getvalue() + captured_out.getvalue()
+    payload["stderr"] = _import_stderr.getvalue() + captured_err.getvalue()
+    _import_stdout, _import_stderr = io.StringIO(), io.StringIO()
+    print(_PROTOCOL_PREFIX + json.dumps({"token": token, "payload": payload}), flush=True)
 '''
 
 
@@ -366,6 +467,9 @@ def run_candidate(
     result_path = tmp_dir / f"result_{token}.json"
 
     env = os.environ.copy()
+    env.pop("PI_SESSION_ID", None)
+    env.pop("PI_SESSION_FILE", None)
+    env.pop("AP_WORKSPACE", None)
     existing = env.get("PYTHONPATH")
     env["PYTHONPATH"] = parent_dir + (os.pathsep + existing if existing else "")
     env["AP_WORKSPACE"] = str(root)
@@ -552,6 +656,9 @@ class CandidateSession:
             else [sys.executable, str(self._driver_path)]
         )
         env = os.environ.copy()
+        env.pop("PI_SESSION_ID", None)
+        env.pop("PI_SESSION_FILE", None)
+        env.pop("AP_WORKSPACE", None)
         existing = env.get("PYTHONPATH")
         env["PYTHONPATH"] = parent_dir + (os.pathsep + existing if existing else "")
         env["AP_WORKSPACE"] = str(root)
@@ -702,3 +809,274 @@ class CandidateSession:
             with contextlib.suppress(OSError):
                 path.unlink(missing_ok=True)
         self._tmp_paths.clear()
+
+
+class RemoteCandidateSession:
+    """Persistent candidate process on explicitly provided remote search compute.
+
+    Pi orchestration and controller state remain local. The candidate package is
+    staged once per split session, then one SSH process keeps lazy models alive
+    across rows. Pi-runtime candidates use the separate local session class.
+    A private protocol prefix separates driver results from incidental remote or
+    candidate output; this is cooperative isolation, matching the local runner's
+    documented security boundary.
+    """
+
+    def __init__(
+        self, workspace, candidate: Candidate, timeout: float = DEFAULT_TIMEOUT
+    ):
+        remote = load_remote_compute(workspace)
+        if remote is None:
+            raise RunnerError("RemoteCandidateSession needs a remote compute profile.")
+        self.workspace = workspace
+        self.candidate = candidate
+        self.timeout = timeout
+        self.remote = remote
+        self.executor = RemoteExecutor(remote, timeout=max(timeout, 120.0))
+        self._proc: subprocess.Popen | None = None
+        self._driver_path: Path | None = None
+        self._responses: queue.Queue[dict] = queue.Queue()
+        self._stdout: list[str] = []
+        self._stderr: list[str] = []
+        self._lock = threading.Lock()
+        self._calls = 0
+        self._started_at: float | None = None
+        self._prefix = f"__AP_REMOTE_{uuid.uuid4().hex}__"
+        self._remote_root: str | None = None
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+    def start(self) -> None:
+        if self._proc is not None:
+            return
+        root = Path(self.workspace.root).resolve()
+        tmp_dir = Path(self.workspace.tmp_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        token = uuid.uuid4().hex
+        self._driver_path = tmp_dir / f"remote_session_driver_{token}.py"
+        staged_parent = self.executor.staged_dir(
+            root, namespace=f"evaluation-{self.candidate.name}"
+        )
+        # Preserve the workspace's importable package basename remotely: a
+        # candidate may import `<workspace>.schema` or `<workspace>.paths`.
+        remote_root = f"{staged_parent}/{root.name}"
+        self._remote_root = remote_root
+        remote_candidate = f"{remote_root}/candidates/{self.candidate.name}.py"
+        remote_parent = staged_parent
+        output_spec = [
+            {"name": f.name, "base": f.base.__name__}
+            for f in self.workspace.schema.outputs
+        ]
+        deps = runtime_deps(self.candidate, self.workspace.dist_name)
+        block = _driver_pep723(self.candidate, deps, self.workspace.dist_name) if deps else ""
+        prelude = (
+            f"_CANDIDATE_PATH = {remote_candidate!r}\n"
+            f"_PARENT_DIR = {remote_parent!r}\n"
+            f"_OUTPUT_SPEC = {output_spec!r}\n"
+            f"_PROTOCOL_PREFIX = {self._prefix!r}\n"
+        )
+        self._driver_path.write_text(
+            block + prelude + _REMOTE_SESSION_DRIVER_BODY,
+            encoding="utf-8",
+        )
+        self.executor.sync_to(
+            root,
+            remote_root,
+            excludes=(
+                ".ap/controller",
+                ".ap/outputs",
+                ".agents",
+                ".claude",
+                "data",
+                "logs",
+                "metric.py",
+                "metric_approval.json",
+                "scores.json",
+                "budget.json",
+                "split.json",
+                "resources.json",
+                "final_report.json",
+            ),
+        )
+        remote_driver = f"{remote_root}/.ap/{self._driver_path.name}"
+        executable = (
+            f"uv run --no-project --quiet {shlex.quote(remote_driver)}"
+            if deps
+            else f"python3 {shlex.quote(remote_driver)}"
+        )
+        environment = gpu_environment_prefix(self.remote)
+        exported = f"export {environment}; " if environment else ""
+        command = (
+            f"cd {shlex.quote(remote_root)} && {exported}exec {executable}"
+        )
+        try:
+            self._started_at = time.monotonic()
+            self._proc = subprocess.Popen(
+                ["ssh", self.remote.endpoint, command],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                start_new_session=(os.name == "posix"),
+            )
+        except FileNotFoundError as exc:
+            self._cleanup()
+            raise RunnerError(f"Could not launch remote candidate session: {exc}") from exc
+        threading.Thread(target=self._read_stdout, daemon=True).start()
+        threading.Thread(
+            target=CandidateSession._drain,
+            args=(self._proc.stderr, self._stderr),
+            daemon=True,
+        ).start()
+
+    def _read_stdout(self) -> None:
+        if self._proc is None or self._proc.stdout is None:
+            return
+        for line in self._proc.stdout:
+            if not line.startswith(self._prefix):
+                self._stdout.append(line)
+                continue
+            try:
+                message = json.loads(line[len(self._prefix):])
+            except json.JSONDecodeError:
+                self._stdout.append(line)
+                continue
+            if isinstance(message, dict):
+                self._responses.put(message)
+
+    def run(self, inputs: dict) -> RunResult:
+        self.start()
+        assert self._proc is not None and self._proc.stdin is not None
+        with self._lock:
+            token = uuid.uuid4().hex
+            cold = self._calls == 0
+            self._calls += 1
+            started = self._started_at if cold and self._started_at else time.monotonic()
+            try:
+                self._proc.stdin.write(json.dumps({"token": token, "inputs": inputs}) + "\n")
+                self._proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                return self._dead_result(inputs, started, cold)
+            deadline = started + self.timeout
+            deferred: list[dict] = []
+            payload = None
+            while time.monotonic() < deadline:
+                if self._proc.poll() is not None and self._responses.empty():
+                    break
+                try:
+                    message = self._responses.get(timeout=min(0.1, max(0.01, deadline - time.monotonic())))
+                except queue.Empty:
+                    continue
+                if message.get("token") == token:
+                    payload = message.get("payload") or {}
+                    break
+                deferred.append(message)
+            for message in deferred:
+                self._responses.put(message)
+            if payload is None:
+                if self._proc.poll() is None:
+                    _kill_process_group(self._proc)
+                return RunResult(
+                    ok=False,
+                    outputs=None,
+                    error=(
+                        f"remote candidate timed out after {self.timeout}s"
+                        if time.monotonic() >= deadline
+                        else "remote candidate session exited unexpectedly"
+                    ),
+                    stdout="".join(self._stdout),
+                    stderr="".join(self._stderr),
+                    duration_s=time.monotonic() - started,
+                    cost_dollars=self.candidate.cost_per_call,
+                    candidate=self.candidate.name,
+                    inputs=dict(inputs),
+                    cold_start=cold,
+                )
+            elapsed = time.monotonic() - started
+            duration = elapsed if cold else float(payload.get("duration_s") or elapsed)
+            cost = payload.get("cost_dollars")
+            if cost is None:
+                cost = self.candidate.cost_per_call
+            common = dict(
+                stdout=str(payload.get("stdout") or ""),
+                stderr=str(payload.get("stderr") or ""),
+                duration_s=duration,
+                cost_dollars=cost,
+                candidate=self.candidate.name,
+                inputs=dict(inputs),
+                cold_start=cold,
+            )
+            if payload.get("ok"):
+                return RunResult(
+                    ok=True, outputs=payload.get("outputs"), error=None, **common
+                )
+            return RunResult(
+                ok=False,
+                outputs=None,
+                error=str(payload.get("error") or "predict() failed remotely"),
+                **common,
+            )
+
+    def _dead_result(self, inputs: dict, started: float, cold: bool) -> RunResult:
+        return RunResult(
+            ok=False,
+            outputs=None,
+            error="remote candidate session exited unexpectedly\n" + "".join(self._stderr)[-STDERR_TAIL:],
+            stdout="".join(self._stdout),
+            stderr="".join(self._stderr),
+            duration_s=time.monotonic() - started,
+            cost_dollars=self.candidate.cost_per_call,
+            candidate=self.candidate.name,
+            inputs=dict(inputs),
+            cold_start=cold,
+        )
+
+    def close(self) -> None:
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write('{"stop": true}\n')
+                proc.stdin.flush()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                _kill_process_group(proc)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=2)
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        if self._driver_path is not None:
+            with contextlib.suppress(OSError):
+                self._driver_path.unlink(missing_ok=True)
+
+
+def candidate_session(
+    workspace, candidate: Candidate, timeout: float = DEFAULT_TIMEOUT
+):
+    """Place heavy evaluation remotely while retaining local Pi OAuth access."""
+    remote = load_remote_compute(workspace)
+    # Network/API points stay beside their authenticated host environment;
+    # build-heavy local-model/classical points use the supplied target. This
+    # avoids both credential copying and the blunt "run absolutely everything
+    # remotely" policy.
+    network_bound = bool(
+        candidate.pi_runtime
+        or candidate.network_required
+        or candidate.api_providers
+    )
+    planned = candidate_placement(workspace, candidate.name)
+    compute_heavy = (
+        planned == "remote"
+        if planned is not None
+        else candidate.compute_heavy
+    )
+    if remote is not None and compute_heavy and not network_bound:
+        return RemoteCandidateSession(workspace, candidate, timeout=timeout)
+    return CandidateSession(workspace, candidate, timeout=timeout)

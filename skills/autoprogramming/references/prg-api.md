@@ -42,6 +42,64 @@ prg.data          # SplitView(train=<n>, val=<n>)
   storage outside the coding-agent workspace; legacy/manual workspaces retain
   their CSV layout.
 
+## Same-session Pi host orchestration
+
+When optimization starts from a live Pi conversation, that human-facing session
+is the sole strategy orchestrator. The library does not launch another strategy
+process. After metric approval, the current agent performs and records research:
+
+```py
+prg.web_search(query: str, *, limit: int = 6) -> SearchReport
+```
+
+Task-derived web queries require confirmed external egress. Run at least two
+distinct queries yielding at least two sources; private examples are never added
+automatically. Evidence is persisted under `.ap/controller/research.json`.
+Planning before that gate raises `WebResearchError`:
+
+```py
+prg.plan_portfolio(
+    specs: list[ap.AvenueSpec | dict], *, exclusions=None, policy=None
+) -> dict
+```
+
+The host-authored plan is validated/fill-completed by the deterministic breadth
+policy. Then drive one controller phase at a time:
+
+```py
+prg.orchestrate_portfolio("breadth", budget=ap.Budget(dollars=20))
+state = prg.portfolio_status()  # complete source/audit/failure/objective evidence
+prg.orchestrate_portfolio("deepen", avenue_ids=["specialized-model"])
+prg.orchestrate_portfolio("compose")
+```
+
+These calls may launch implementation workers and independent auditors, never a
+strategy orchestrator. A supplied phase budget replaces the total limits while
+preserving all prior spend; later phases may pass a larger explicit total budget
+or use remaining headroom. Inspect `state` in the same conversation, ask the human
+about unresolved blockers, and call `finalize()` explicitly only when
+`state["may_finalize"]` is true.
+
+Worker crashes, malformed source, cross-family substitutions, all-run errors,
+and suspicious zero outputs are implementation evidence—not family outcomes.
+They trigger bounded same-mechanism repairs and a materially independent worker
+configuration. `FAILED`/`NONCOMPLIANT` never satisfy breadth; only evaluated
+faithful implementations or human-confirmed infeasibility do.
+
+Pi workers default to the exact host provider/model/thinking level. The host can
+set an avenue's `worker_model` to another exact pattern in the discovered
+`resources.search.pi_models` registry when a stronger specialist is appropriate.
+Stored Pi OAuth is resolved by Pi itself, so no raw SDK key is required. A model-call candidate
+may invoke persistent Pi CLI/RPC and is reported as requiring Pi plus an
+authenticated subscription at deployment.
+
+If the user supplied `SearchResources.remote_compute`, heavy worker operations
+and candidate evaluation are staged there. Pi-runtime candidates remain beside
+the authenticated host, so OAuth credentials are never copied remotely.
+GPU-heavy avenues are admitted under a per-target concurrency/VRAM lease (one
+concurrent GPU job by default). Remote compute is optional and is never inferred
+or hard-coded by the skill.
+
 ## Metric first: `propose_metric`
 
 No scoring happens until the workspace's `metric.py` is approved. Metrics are a
@@ -182,6 +240,8 @@ def predict(english: str) -> French:
     scored with 1 repeat instead of 3, saving budget. Default false.
   - `cost_per_call = <float>` — flat dollar cost charged per run when the run
     does not report its own cost.
+  - `pi_runtime = true` — `predict()` invokes Pi CLI/RPC and therefore must run
+    beside the authenticated host rather than copying OAuth to remote compute.
   - `fetch = ["huggingface:...", ...]` — declared artifact download steps
     (recorded candidate metadata for heavyweight models).
 - **`AP_COST_DOLLARS`** — a candidate that spends money per call should set
@@ -307,17 +367,17 @@ candidates no other candidate dominates (>= on every shared row, > on one);
 `split="train", per_instance=True` to include them). Complementary candidates
 that win different rows are prime material for a merged/pipeline candidate.
 
-## Resolve an environment blocker: `resolve_blocker`
+## Resolve an environment or implementation blocker: `resolve_blocker`
 
 ```py
 prg.resolve_blocker(avenue_id, action, confirmed_by="user")
 ```
 
-When every run of a faithful approach fails for an environmental reason (missing
-API access, package, model, GPU, network, etc.), or controller preflight finds a
-required capability absent, the portfolio pauses. It does **not** accept a
-cross-family fallback and does not silently discard the approach. Check with the
-human first: they may be able to install/provision/fix it.
+After bounded same-family diagnosis/repair and an independent configuration, an
+ambiguous implementation or environment failure (missing access, package, model,
+GPU, network, remote transport, etc.) pauses the portfolio. It does **not**
+accept a cross-family fallback, count broken code as breadth, or silently discard
+the approach. Check with the human first: they may be able to provision/fix it.
 
 - `action="retry"` — the human fixed the capability or explicitly requests
   another attempt. This grants one retry even when conservative preflight still

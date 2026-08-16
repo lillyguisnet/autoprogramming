@@ -146,6 +146,22 @@ class FinalReport:
             for row in table
         ]
         lines = ["", "quality / cost tradeoffs:", *rendered]
+        compute_targets = sorted({
+            str(e.get("evaluation_compute"))
+            for e in objective_entries if e.get("evaluation_compute")
+        })
+        if compute_targets:
+            lines.append("evaluation compute: " + ", ".join(compute_targets))
+        constrained = [
+            e for e in objective_entries if e.get("deployment_notes")
+        ]
+        if constrained:
+            lines.append("deployment requirements:")
+            for entry in constrained:
+                lines.append(
+                    f"  {entry['candidate']}: "
+                    + "; ".join(entry["deployment_notes"])
+                )
         alts = [
             e for e in objective_entries
             if e["candidate"] in self.frontier and e["candidate"] != self.activated
@@ -231,7 +247,17 @@ class AgentHarness:
         ledger.check()
         schema = ws.schema
         row_dict = rows[row]
-        result = run_candidate(ws, cand, schema.coerce_inputs(row_dict))
+        inputs = schema.coerce_inputs(row_dict)
+        from . import runner as runner_mod
+
+        if (
+            run_candidate is runner_mod.run_candidate
+            and getattr(runner_mod, "candidate_session", None) is not None
+        ):
+            with runner_mod.candidate_session(ws, cand) as session:
+                result = session.run(inputs)
+        else:
+            result = run_candidate(ws, cand, inputs)
         ledger.charge(
             eval_calls=1, dollars=result.cost_dollars or 0.0, category="candidate"
         )
@@ -351,6 +377,168 @@ class AgentHarness:
 
         return metric_suite(self._workspace)
 
+    def web_search(self, query: str, *, limit: int = 6):
+        """Search current public sources and persist citations for planning.
+
+        This method is intentionally called by the human-facing Pi agent: its
+        conversation remains the strategy context. Task examples are never
+        placed in the query automatically.
+        """
+        resources_path = self._workspace.resources_json
+        if not resources_path.exists():
+            from .research import WebResearchError
+
+            raise WebResearchError(
+                "Web research needs a confirmed Resources profile so data-egress "
+                "permission is explicit."
+            )
+        from .resources import Resources
+        from .research import WebResearchError, record_report, search_web
+
+        resources = Resources.from_dict(json.loads(resources_path.read_text()))
+        if resources.data.external_egress is not True:
+            raise WebResearchError(
+                "Web research would send a task-derived query off-machine, but "
+                "data.external_egress is not permitted. Ask the human to permit "
+                "abstract task research or explicitly resolve this blocker; do "
+                "not plan from stale model memory."
+            )
+        normalized_query = str(query).casefold()
+        # Research should describe the task, not publish demonstration rows.
+        for row in data_mod.load_split(self._workspace, "dev"):
+            for value in row.values():
+                text = str(value).strip()
+                if len(text) >= 16 and text.casefold() in normalized_query:
+                    raise WebResearchError(
+                        "The search query contains a verbatim development-example "
+                        "value. Rewrite it as an abstract task/capability query."
+                    )
+        report = search_web(query, limit=limit)
+        record_report(self._workspace, report)
+        return report
+
+    def plan_portfolio(self, specs, *, exclusions=None, policy=None):
+        """Record a web-informed plan authored by this current Pi session."""
+        from dataclasses import replace
+
+        from .portfolio import AvenueSpec, Portfolio, PortfolioPolicy
+        from .research import ensure_researched
+        from .resources import Resources
+
+        evidence = ensure_researched(self._workspace)
+        metric_mod.ensure_approved(self._workspace)
+        resources = Resources.from_dict(
+            json.loads(self._workspace.resources_json.read_text())
+        )
+        sources = tuple(
+            str(item.get("url"))
+            for item in evidence.get("sources", [])
+            if item.get("url")
+        )
+        known_sources = set(sources)
+        normalized = []
+        for raw in specs:
+            spec = raw if isinstance(raw, AvenueSpec) else AvenueSpec.from_dict(raw)
+            if not spec.research_sources:
+                spec = replace(spec, research_sources=sources)
+            elif not set(spec.research_sources).issubset(known_sources):
+                from .research import WebResearchError
+
+                raise WebResearchError(
+                    f"Avenue {spec.id!r} cites a URL absent from the persisted "
+                    "web-search evidence."
+                )
+            normalized.append(spec)
+        effective_policy = policy
+        if isinstance(effective_policy, dict):
+            effective_policy = PortfolioPolicy(**effective_policy)
+        elif effective_policy is not None and not isinstance(
+            effective_policy, PortfolioPolicy
+        ):
+            raise TypeError("policy= must be PortfolioPolicy, a dict, or None.")
+        if effective_policy is None and guards.is_bootstrap(self._workspace):
+            effective_policy = PortfolioPolicy(min_configs_before_abandon=1)
+        portfolio = Portfolio.create(
+            resources,
+            normalized,
+            exclusions=exclusions,
+            policy=effective_policy,
+            fill_missing=True,
+        )
+        for avenue in portfolio.avenues:
+            if not avenue.spec.research_sources:
+                avenue.spec = replace(
+                    avenue.spec, research_sources=sources
+                )
+        self._workspace.portfolio_json.parent.mkdir(parents=True, exist_ok=True)
+        portfolio.write(self._workspace.portfolio_json)
+        return portfolio.to_dict()
+
+    def portfolio_status(self) -> dict:
+        """Full implementation/audit/failure evidence for host strategy."""
+        if not self._workspace.portfolio_json.exists():
+            raise NotOptimizedError(
+                "No host portfolio exists yet. Search the web and call "
+                "prg.plan_portfolio([...]) first."
+            )
+        from .portfolio import Portfolio
+
+        portfolio = Portfolio.load(self._workspace.portfolio_json)
+        status = portfolio.to_dict()
+        status["may_finalize"] = portfolio.may_finalize
+        status["unresolved_blocker_ids"] = [
+            avenue.spec.id for avenue in portfolio.unresolved_blockers
+        ]
+        return status
+
+    def orchestrate_portfolio(
+        self,
+        phase: str = "breadth",
+        *,
+        avenue_ids=(),
+        budget=None,
+        backend=None,
+    ) -> dict:
+        """Run one trusted controller phase; strategy stays in this Pi session.
+
+        ``breadth`` dispatches every planned family and its mandatory independent
+        configuration, ``deepen`` works only the selected avenue ids, and
+        ``compose`` builds from the measured frontier. Pass an explicit
+        ``budget=ap.Budget(...)`` to start/resume a phase with new total limits;
+        prior spend remains charged. This method launches implementation/audit
+        subagents, never another strategy orchestrator.
+        """
+        if phase not in ("breadth", "deepen", "compose"):
+            raise ValueError("phase must be 'breadth', 'deepen', or 'compose'.")
+        if not self._workspace.portfolio_json.exists():
+            raise NotOptimizedError(
+                "No portfolio plan exists. Call prg.plan_portfolio([...]) after "
+                "the required web research."
+            )
+        if budget is not None:
+            from .budget import Budget, BudgetLedger
+
+            if not isinstance(budget, Budget):
+                raise TypeError("budget= must be an ap.Budget instance.")
+            BudgetLedger.start(self._workspace.budget_json, budget)
+        from .pi_backend import PiOrchestratorBackend
+        from .resources import Resources
+
+        resources = Resources.from_dict(
+            json.loads(self._workspace.resources_json.read_text())
+        )
+        controller = backend or PiOrchestratorBackend(
+            resources=resources,
+            host_orchestrated=True,
+        )
+        controller.run(self, context={
+            "mode": "optimize",
+            "host_orchestrated": True,
+            "host_phase": phase,
+            "selected_ids": list(avenue_ids),
+        })
+        return self.portfolio_status()
+
     def resolve_blocker(
         self, avenue_id: str, action: str, *, confirmed_by: str
     ) -> None:
@@ -390,6 +578,19 @@ class AgentHarness:
                 f"instead. To keep improving, start a new workspace (fresh "
                 f"data split) and optimize again."
             )
+        if ws.portfolio_json.exists():
+            from .portfolio import Portfolio
+
+            portfolio = Portfolio.load(ws.portfolio_json)
+            if not portfolio.may_finalize:
+                blocked = [a.spec.id for a in portfolio.unresolved_blockers]
+                raise NotOptimizedError(
+                    "Cannot finalize: the controller-enforced portfolio lacks "
+                    "conclusive breadth evidence or has unresolved blockers. "
+                    f"Blocked avenues: {blocked}. Inspect "
+                    "prg.portfolio_status(), repair/retry implementations, or "
+                    "obtain explicit human exclusions first."
+                )
         metric_mod.ensure_approved(ws)
         scores = scoring.load_scores(ws)
         val_scored = list(dict.fromkeys(scores.get("val_scored", [])))
@@ -428,11 +629,32 @@ class AgentHarness:
 
         flags = scores.get("flags", {})
         flagged = {n: flags[n] for n in val_scored if flags.get(n)}
+        human_excluded: set[str] = set()
+        if ws.portfolio_json.exists():
+            from .portfolio import AvenueStatus, Portfolio
+
+            portfolio = Portfolio.load(ws.portfolio_json)
+            human_excluded = {
+                candidate
+                for avenue in portfolio.avenues
+                if avenue.status == AvenueStatus.INFEASIBLE
+                and any("human blocker resolution" in note for note in avenue.notes)
+                for candidate in avenue.candidates
+            }
         eligible = [
             n for n in val_scored
-            if n not in flagged and n not in stale and _val_stats(scores, n) is not None
+            if n not in flagged
+            and n not in stale
+            and n not in human_excluded
+            and _val_stats(scores, n) is not None
         ]
         if not eligible:
+            if human_excluded:
+                raise NotOptimizedError(
+                    "Cannot finalize: every otherwise eligible candidate belongs "
+                    "to an approach the human explicitly excluded. Retry/provision "
+                    "a faithful family or evaluate another conclusive avenue."
+                )
             if flagged:
                 details = "; ".join(f"{n}: {'; '.join(fl)}" for n, fl in flagged.items())
                 raise NotOptimizedError(
@@ -504,19 +726,28 @@ class AgentHarness:
             f"row_{i}": schema.coerce_expected(r) for i, r in enumerate(test_rows)
         }
         entries: list[dict] = []
+        avenue_metadata = _candidate_avenue_metadata(ws)
         for name in top:
             cand = candidates_mod.load_candidate(ws, name)
+            evaluation_compute = _evaluation_compute_label(ws, cand)
             n_repeats = 1 if cand.deterministic else scoring.DEFAULT_REPEATS
             cache_rows: dict[str, list[dict]] = {}
             from . import runner as runner_mod
 
+            session_factory = (
+                getattr(runner_mod, "candidate_session", None)
+                if run_candidate is runner_mod.run_candidate
+                else None
+            )
             session_cls = (
                 getattr(runner_mod, "CandidateSession", None)
                 if run_candidate is runner_mod.run_candidate
                 else None
             )
             session_context = (
-                session_cls(ws, cand)
+                session_factory(ws, cand)
+                if session_factory is not None
+                else session_cls(ws, cand)
                 if session_cls is not None
                 else contextlib.nullcontext(None)
             )
@@ -557,6 +788,15 @@ class AgentHarness:
             note = f"val was {val_mean:.2f} — " + (
                 "overfit to val, demoted" if demoted else "healthy gap"
             )
+            metadata = avenue_metadata.get(name, {})
+            deployment_notes = list(metadata.get("deployment_notes", []))
+            if cand.pi_runtime:
+                pi_requirement = (
+                    "requires the Pi CLI and an authenticated model subscription "
+                    "at deployment; no raw provider API key is required"
+                )
+                if pi_requirement not in deployment_notes:
+                    deployment_notes.append(pi_requirement)
             entries.append({
                 "candidate": name,
                 "val_mean": val_mean,
@@ -567,6 +807,11 @@ class AgentHarness:
                 "objectives": objectives,
                 "frontier": False,
                 "cold_start_s": sub.get("cold_start_s"),
+                "approach_tier": metadata.get("tier"),
+                "approach": metadata.get("title"),
+                "runtime_requirements": metadata.get("runtime_requirements", []),
+                "deployment_notes": deployment_notes,
+                "evaluation_compute": evaluation_compute,
             })
 
         entries.sort(key=lambda e: (-e["test_mean"], _cand_key(e["candidate"])))
@@ -700,6 +945,54 @@ def _cand_key(name: str):
 
 def _row_key(row_id: str):
     return _cand_key(row_id)
+
+
+def _evaluation_compute_label(workspace, candidate: Candidate | None = None) -> str:
+    path = getattr(workspace, "resources_json", None)
+    if path is None or not path.exists():
+        return "local"
+    try:
+        resources = json.loads(path.read_text())
+        remote = (resources.get("search") or {}).get("remote_compute")
+        if isinstance(remote, dict) and remote.get("endpoint"):
+            if candidate is not None:
+                if candidate.pi_runtime:
+                    return "local:authenticated-pi-host"
+                if candidate.network_required or candidate.api_providers:
+                    return "local:authenticated-network-host"
+                from .remote import candidate_placement
+
+                planned = candidate_placement(workspace, candidate.name)
+                if planned == "local" or (
+                    planned is None and not candidate.compute_heavy
+                ):
+                    return "local:lightweight-host"
+            return f"remote:{remote['endpoint']}"
+    except (OSError, ValueError, TypeError):
+        pass
+    return "local"
+
+
+def _candidate_avenue_metadata(workspace) -> dict[str, dict]:
+    path = getattr(workspace, "portfolio_json", None)
+    if path is None or not path.exists():
+        return {}
+    try:
+        portfolio = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    result: dict[str, dict] = {}
+    for avenue in portfolio.get("avenues", []):
+        spec = avenue.get("spec") or {}
+        metadata = {
+            "tier": spec.get("tier"),
+            "title": spec.get("title"),
+            "runtime_requirements": list(spec.get("runtime_requirements") or []),
+            "deployment_notes": list(spec.get("deployment_notes") or []),
+        }
+        for candidate in avenue.get("candidates", []):
+            result[str(candidate)] = metadata
+    return result
 
 
 def _diverse_finalists(workspace, ordered: list[str], limit: int) -> list[str]:

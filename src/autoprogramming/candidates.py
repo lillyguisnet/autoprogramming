@@ -90,6 +90,45 @@ class Candidate:
         return tuple(self.tool_ap.get("fetch", ()))
 
     @property
+    def pi_runtime(self) -> bool:
+        """Whether prediction calls the authenticated local Pi runtime."""
+        if bool(self.tool_ap.get("pi_runtime", False)):
+            return True
+        # Placement defense for composed/legacy candidates that omitted the
+        # metadata. Pi-assigned avenues still fail adherence until they declare
+        # it explicitly.
+        return bool(
+            re.search(r"(?is)subprocess.{0,500}?[\"']pi[\"']", self.source)
+            or re.search(
+                r"(?is)[\"']pi[\"']\s*,\s*[\"']--(?:mode|print)",
+                self.source,
+            )
+        )
+
+    @property
+    def network_required(self) -> bool:
+        """Whether prediction depends on a network service at runtime."""
+        return bool(self.tool_ap.get("network_required", False))
+
+    @property
+    def api_providers(self) -> tuple[str, ...]:
+        """Declared runtime provider names, without credentials."""
+        return tuple(str(v) for v in self.tool_ap.get("api_providers", ()))
+
+    @property
+    def compute_heavy(self) -> bool:
+        """Explicit or dependency-derived search-compute placement hint."""
+        declared = self.tool_ap.get("compute_heavy")
+        if declared is not None:
+            return bool(declared)
+        heavy = " ".join((*self.dependencies, *self.fetch)).casefold()
+        return any(token in heavy for token in (
+            "torch", "tensorflow", "jax", "transformers", "onnxruntime",
+            "scikit-learn", "sklearn", "xgboost", "lightgbm", "catboost",
+            "opencv", "sentence-transformers", "huggingface:",
+        ))
+
+    @property
     def artifact_namespace(self) -> str | None:
         """Optional isolated subdirectory under the package's artifacts/."""
         value = self.tool_ap.get("artifact_namespace")

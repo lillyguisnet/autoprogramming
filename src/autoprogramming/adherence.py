@@ -96,10 +96,25 @@ def deterministic_audit(spec: AvenueSpec, source: str) -> ApproachAudit:
         violations.append("solution.py does not define predict with a top-level def")
 
     tier = spec.tier
-    has_api = _contains_any(source, _API_MARKERS)
+    needs_pi = any(
+        item.startswith("pi-model:")
+        for item in (*spec.required_capabilities, *spec.required_mechanisms)
+    )
+    declares_pi_runtime = bool(
+        re.search(r"(?im)^\s*#\s*pi_runtime\s*=\s*true\s*$", source)
+    )
+    has_api = _contains_any(source, _API_MARKERS) or (
+        needs_pi and declares_pi_runtime
+    )
     has_deep = _contains_any(source, _DEEP_MARKERS)
     has_classical = _contains_any(source, _CLASSICAL_MARKERS)
     has_rules = _contains_any(source, _RULE_MARKERS)
+
+    if needs_pi and not declares_pi_runtime:
+        violations.append(
+            "Pi-backed implementation must declare `pi_runtime = true` under "
+            "[tool.ap] so OAuth-bound evaluation remains beside the host"
+        )
 
     if tier in (
         ApproachTier.GENERALIST_AGENT,
