@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -19,6 +20,9 @@ from .remote import (
 )
 from .resources import RemoteCompute, Resources
 
+_WORKER_SYNC_EXCLUDES = (".venv", ".venv-*", ".venv_*", ".uv-cache")
+
+
 WORKER_SYSTEM = """You are the sole implementation engineer for a standalone
 Python function. Your first and non-negotiable obligation is MECHANISM FIDELITY:
 implement exactly the approach contract in task.md and push that particular
@@ -28,7 +32,10 @@ approach is a failure, even if it avoids an exception or appears more reliable.
 NEVER replace the assigned mechanism because a package, model, API credential,
 GPU, network service, or other capability is missing in your authoring shell.
 Third-party packages need not already be installed: declare them in the PEP 723
-block so the execution controller can resolve them. Pi model access is different
+block so the execution controller can resolve them. Do not create multiple
+persistent virtual environments for experiments. If a dependency must be tested,
+reuse one `.venv` in this task directory and treat it as disposable scratch; never
+place required runtime files there. Pi model access is different
 from a raw SDK key: when task.md lists an authenticated Pi model, the local Pi
 CLI resolves its stored OAuth/subscription login itself. Do not reject that
 capability merely because OPENAI_API_KEY/ANTHROPIC_API_KEY is absent; use Pi's
@@ -82,9 +89,13 @@ class PiWorkerRunner:
             RemoteExecutor(self.remote_compute) if self.remote_compute else None
         )
         remote_root = None
+        remote_uv_cache = None
         if remote_executor is not None:
             remote_root = remote_executor.staged_dir(cwd, namespace=cwd.name)
-            remote_executor.sync_to(cwd, remote_root)
+            remote_uv_cache = f"{remote_root}-uv-cache"
+            remote_executor.sync_to(
+                cwd, remote_root, excludes=_WORKER_SYNC_EXCLUDES
+            )
 
         guard_source = Path(__file__).parent / "pi" / "worker-guard.ts"
         guard = cwd / ".tools" / "root-guard.ts"
@@ -115,11 +126,17 @@ class PiWorkerRunner:
             args.extend(("--model", model))
         args.append(task)
         env = worker_env(allowed_api_providers, pi_model=model)
+        # Worker package installs belong to this search run, not to the user's
+        # global uv cache. The run cache stays available for repair turns and is
+        # removed by cleanup_worker_cache after finalization.
+        env["UV_CACHE_DIR"] = str(worker_uv_cache_dir(cwd))
         if remote_executor is not None:
             env["AP_REMOTE_ENDPOINT"] = self.remote_compute.endpoint
             env["AP_REMOTE_CWD"] = str(remote_root)
-            env["AP_REMOTE_ENV_PREFIX"] = gpu_environment_prefix(
-                self.remote_compute
+            remote_prefix = gpu_environment_prefix(self.remote_compute)
+            cache_assignment = f"UV_CACHE_DIR={shlex.quote(str(remote_uv_cache))}"
+            env["AP_REMOTE_ENV_PREFIX"] = " ".join(
+                value for value in (remote_prefix, cache_assignment) if value
             )
         try:
             proc = subprocess.run(
@@ -143,7 +160,9 @@ class PiWorkerRunner:
             if remote_executor is not None and remote_root is not None:
                 # Retrieve even a partial solution: the controller will audit it
                 # and can ask the same approach worker to repair it.
-                remote_executor.sync_from(remote_root, cwd)
+                remote_executor.sync_from(
+                    remote_root, cwd, excludes=_WORKER_SYNC_EXCLUDES
+                )
 
         messages: list[dict] = []
         usage = PiUsage()
@@ -414,8 +433,7 @@ that directory is `Path(__file__).parents[1] / "artifacts" / "{spec.id}"`.
 """
 
 
-def worker_run_dir(workspace) -> Path:
-    """Opaque worker root outside the optimizer/package workspace."""
+def _worker_token(workspace) -> str:
     try:
         token = workspace.active.get("private_data_id")
     except Exception:
@@ -424,11 +442,114 @@ def worker_run_dir(workspace) -> Path:
         token = hashlib.sha256(
             str(Path(workspace.root).resolve()).encode()
         ).hexdigest()[:24]
-    base = Path(os.environ.get("AP_WORKER_DIR", Path.home() / ".cache" / "ap-work"))
-    path = base / str(token)
+    token = str(token)
+    if not token or Path(token).name != token or token in (".", ".."):
+        raise RunnerError(f"Unsafe AutoProgramming worker cache id {token!r}.")
+    return token
+
+
+def worker_cache_base() -> Path:
+    return Path(
+        os.environ.get("AP_WORKER_DIR", Path.home() / ".cache" / "ap-work")
+    ).expanduser()
+
+
+def worker_run_path(workspace) -> Path:
+    """Worker root without creating it; cleanup must never recreate dead runs."""
+    return worker_cache_base() / _worker_token(workspace)
+
+
+def worker_run_dir(workspace) -> Path:
+    """Opaque worker root outside the optimizer/package workspace."""
+    path = worker_run_path(workspace)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
+def worker_uv_cache_dir(cwd: Path) -> Path:
+    """Shared uv cache owned by the worker run containing ``cwd``."""
+    return Path(cwd).resolve().parent / ".uv-cache"
+
+
 def avenue_dir(workspace, avenue_id: str) -> Path:
     return worker_run_dir(workspace) / avenue_id
+
+
+def _tree_size(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return total
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += (Path(root) / name).stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def cleanup_worker_cache(workspace, *, force: bool = False) -> dict:
+    """Remove one run's local and remote worker scratch.
+
+    Unfinished runs retain their worker files by default because repair and
+    deepening turns resume from ``solution.py`` and task-local artifacts.
+    ``force=True`` is therefore an explicit abandonment operation.
+    """
+    try:
+        finalized = bool(workspace.active.get("finalized"))
+    except Exception:
+        finalized = False
+    if not finalized and not force:
+        raise RunnerError(
+            "Refusing to remove worker cache for an unfinished search. Finalize "
+            "the workspace first, or pass force=True to abandon worker resume state."
+        )
+
+    base = worker_cache_base().resolve()
+    root = worker_run_path(workspace)
+    if root.parent.resolve() != base:
+        raise RunnerError(f"Refusing unsafe worker cache cleanup outside {base}.")
+
+    remote_removed: list[str] = []
+    remote_errors: list[str] = []
+    portfolio_path = getattr(workspace, "portfolio_json", None)
+    if portfolio_path is not None and Path(portfolio_path).exists():
+        try:
+            from .portfolio import Portfolio
+            from .remote import use_remote_for_avenue
+
+            portfolio = Portfolio.load(portfolio_path)
+            remote = portfolio.resources.search.remote_compute
+            if remote is not None:
+                executor = RemoteExecutor(remote)
+                targets: list[str] = []
+                for avenue in portfolio.avenues:
+                    if not use_remote_for_avenue(avenue.spec):
+                        continue
+                    local_avenue = root / avenue.spec.id
+                    remote_root = executor.staged_dir(
+                        local_avenue, namespace=local_avenue.name
+                    )
+                    targets.extend((remote_root, f"{remote_root}-uv-cache"))
+                if targets:
+                    executor.ssh(
+                        "rm -rf -- " + " ".join(shlex.quote(v) for v in targets)
+                    )
+                    remote_removed.extend(targets)
+        except Exception as exc:
+            # Finalization is already durable. A disconnected optional compute
+            # target must not turn cache hygiene into a failed program result.
+            remote_errors.append(str(exc))
+
+    bytes_removed = 0 if root.is_symlink() else _tree_size(root)
+    if root.is_symlink():
+        root.unlink(missing_ok=True)
+    elif root.exists():
+        shutil.rmtree(root)
+    return {
+        "path": str(root),
+        "bytes_removed": bytes_removed,
+        "removed": not root.exists(),
+        "remote_removed": remote_removed,
+        "remote_errors": remote_errors,
+    }

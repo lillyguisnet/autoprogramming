@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Bounded PEP 723 evaluation environments with stable dependency-keyed drivers,
+  moved worker UV data into run-owned caches, and added guarded local/remote
+  scratch cleanup after finalization.
 - Made the human-facing Pi session the sole strategy orchestrator; live runs use
   staged host APIs instead of spawning a second context-poor strategy process.
 - Added mandatory, persisted web research before host/headless portfolio plans.

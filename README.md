@@ -245,8 +245,15 @@ uv run candidates/candidate_0.py "Hello, how are you?"
 ```
 
 - **Every candidate runs standalone.** `uv run` reads the `# /// script` block, builds an ephemeral venv with exactly that candidate's deps, and executes it. Debugging a candidate is running a file — no project setup.
-- **Candidates with conflicting dependencies coexist.** candidate_2 can need `transformers==4.40` while candidate_5 needs `4.51`; the eval harness runs each in its own uv-resolved environment. The dependency solver is uv's, not ours.
+- **Candidates with conflicting dependencies coexist.** candidate_2 can need `transformers==4.40` while candidate_5 needs `4.51`; the eval harness runs each in its own uv-resolved environment. Stable, dependency-keyed drivers let UV reuse environments instead of creating one for every evaluation call. The dependency solver is uv's, not ours.
 - **The packager reads the same block.** No parallel metadata format to keep in sync — the active candidate's `dependencies` list *is* the package's dependency list.
+
+Implementation workers use an AutoProgramming-owned UV cache under
+`~/.cache/ap-work/<run>/`. Successful finalization removes that local/remote
+scratch automatically; paused runs retain it for resume. For a deliberately
+abandoned run, attach to the workspace and call
+`prg.cleanup_search_cache(force=True)`. Existing global UV cache left by older
+versions can be reclaimed once with `uv cache prune`.
 
 The agent evaluates, reflects on **train** failures, then copies and edits the file to create a new candidate:
 

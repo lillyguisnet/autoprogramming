@@ -560,6 +560,17 @@ class AgentHarness:
         portfolio.resolve_blocker(avenue_id, action, confirmed_by)
         portfolio.write(path)
 
+    def cleanup_search_cache(self, *, force: bool = False) -> dict:
+        """Remove AutoProgramming-owned implementation-worker scratch.
+
+        Finalized workspaces are safe to clean. For an unfinished workspace,
+        ``force=True`` explicitly abandons resumable worker state; candidates and
+        materialized runtime artifacts in the workspace are not removed.
+        """
+        from .pi_worker import cleanup_worker_cache
+
+        return cleanup_worker_cache(self._workspace, force=force)
+
     def finalize(self, top_k: int | None = None) -> FinalReport:
         """The one-time test evaluation: score the top val candidates on test,
         demote overfitters, activate the winner, and seal the workspace.
@@ -868,6 +879,18 @@ class AgentHarness:
         )
         ws.activate(winner["candidate"], winner["test_mean"])
         ws.mark_finalized(report.to_dict())
+        if ws.portfolio_json.exists():
+            try:
+                cleanup = self.cleanup_search_cache()
+                cleanup_errors = cleanup["remote_errors"]
+            except Exception as exc:
+                cleanup_errors = [str(exc)]
+            if cleanup_errors:
+                print(
+                    "[autoprogramming] finalized successfully, but worker cache "
+                    "cleanup needs attention: " + "; ".join(cleanup_errors),
+                    file=sys.stderr,
+                )
         return report
 
 

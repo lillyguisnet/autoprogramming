@@ -1,13 +1,13 @@
 """Tests for autoprogramming.runner — the marker-line protocol and fast path.
 
-All candidates here are stdlib-only (or their only dependency is the
-self-reference), so every run uses the sys.executable fast path: no uv, no
-network.
+Most candidates here are stdlib-only (or use only the self-reference), so the
+suite needs no network. One cache-lifecycle test uses a fake uv executable.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import signal
 import time
@@ -391,16 +391,48 @@ def test_driver_pep723_block_strips_self_entries(tmp_path):
     assert sources["other-pkg"] == {"path": "/x"}
 
 
-def test_driver_source_fast_path_has_no_block(tmp_path):
+def test_driver_source_fast_path_has_no_block_or_runtime_paths(tmp_path):
     ws = make_ws(tmp_path)
     cand = write_candidate(ws, UPPER)
-    source = runner._driver_source(
-        cand, (), ws.dist_name, str(tmp_path), [{"name": "Loud", "base": "str"}],
-        tmp_path / "result.json",
-    )
+    source = runner._driver_source(cand, (), ws.dist_name)
     assert "# /// script" not in source
-    assert repr(str(Path(cand.path).resolve())) in source
-    assert repr(str(tmp_path / "result.json")) in source
+    assert str(Path(cand.path).resolve()) not in source
+    assert str(tmp_path / "result.json") not in source
+    config = json.loads(runner._runtime_config(
+        cand, str(tmp_path), [{"name": "Loud", "base": "str"}]
+    ))
+    assert config["candidate_path"] == str(Path(cand.path).resolve())
+
+
+def test_uv_drivers_are_stable_per_dependency_manifest(tmp_path, monkeypatch):
+    ws = make_ws(tmp_path)
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "args = sys.argv[1:]\n"
+        "script = args[args.index('--quiet') + 1]\n"
+        "rest = args[args.index('--quiet') + 2:]\n"
+        "os.execv(sys.executable, [sys.executable, script, *rest])\n"
+    )
+    fake_uv.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    cand = write_candidate(ws, (
+        "# /// script\n# dependencies = [\"not-really-installed\"]\n# ///\n"
+        + UPPER
+    ))
+
+    assert run_candidate(ws, cand, {"text": "one"}).ok
+    assert run_candidate(ws, cand, {"text": "two"}).ok
+    with runner.CandidateSession(ws, cand) as session:
+        assert session.run({"text": "three"}).ok
+    with runner.CandidateSession(ws, cand) as session:
+        assert session.run({"text": "four"}).ok
+
+    assert len(list(Path(ws.tmp_dir).glob("ap_run_*.py"))) == 1
+    assert len(list(Path(ws.tmp_dir).glob("ap_session_*.py"))) == 1
+    assert not list(Path(ws.tmp_dir).glob("driver_*.py"))
+    assert not list(Path(ws.tmp_dir).glob("session_driver_*.py"))
 
 
 def test_tmp_dir_cleaned_up(tmp_path):

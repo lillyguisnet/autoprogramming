@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +28,7 @@ from autoprogramming import metric
 from autoprogramming.budget import Budget, BudgetLedger
 from autoprogramming.harness import AgentHarness
 from autoprogramming.portfolio import default_avenue, ApproachTier, Portfolio
+from autoprogramming.pi_worker import cleanup_worker_cache, worker_run_dir
 from autoprogramming.schema import Schema
 from autoprogramming.workspace import Workspace
 from autoprogramming.errors import RunnerError
@@ -57,7 +59,7 @@ def fake_pi(tmp_path: Path) -> Path:
         "    print(json.dumps({'type':'agent_settled'}), flush=True)\n"
         "else:\n"
         "  pathlib.Path('solution.py').write_text('def predict(text):\\n    return text\\n')\n"
-        "  pathlib.Path('invocation.json').write_text(json.dumps({'argv':args,'cwd':os.getcwd(),'ap':os.environ.get('AP_WORKSPACE'),'openai':os.environ.get('OPENAI_API_KEY'),'groq':os.environ.get('GROQ_API_KEY'),'remote':os.environ.get('AP_REMOTE_ENDPOINT'),'remote_cwd':os.environ.get('AP_REMOTE_CWD')}))\n"
+        "  pathlib.Path('invocation.json').write_text(json.dumps({'argv':args,'cwd':os.getcwd(),'ap':os.environ.get('AP_WORKSPACE'),'openai':os.environ.get('OPENAI_API_KEY'),'groq':os.environ.get('GROQ_API_KEY'),'remote':os.environ.get('AP_REMOTE_ENDPOINT'),'remote_cwd':os.environ.get('AP_REMOTE_CWD'),'uv_cache':os.environ.get('UV_CACHE_DIR'),'remote_prefix':os.environ.get('AP_REMOTE_ENV_PREFIX')}))\n"
         "  message = {'role':'assistant','content':[{'type':'text','text':'implemented'}],"
         "'usage':{'input':3,'output':4,'cacheRead':0,'cacheWrite':0,'cost':{'total':0.005}},'stopReason':'stop'}\n"
         "  print(json.dumps({'type':'message_end','message':message}))\n"
@@ -226,6 +228,7 @@ def test_worker_uses_isolated_discovery_flags_and_scrubs_workspace(tmp_path, mon
     assert invocation["ap"] is None
     assert invocation["openai"] == "allowed"
     assert invocation["groq"] is None
+    assert invocation["uv_cache"] == str(tmp_path / ".uv-cache")
     assert "--no-context-files" in argv
     assert "--no-skills" in argv
     assert "--no-extensions" in argv
@@ -243,15 +246,17 @@ def test_worker_uses_remote_tools_only_when_user_provides_target(
     work = tmp_path / "remote-task"
     work.mkdir()
 
+    sync_calls = {}
+
     class FakeRemote:
         def __init__(self, config):
             self.config = config
         def staged_dir(self, *_args, **_kwargs):
             return "/remote/ap/task"
-        def sync_to(self, *_args, **_kwargs):
-            return None
-        def sync_from(self, *_args, **_kwargs):
-            return None
+        def sync_to(self, *_args, **kwargs):
+            sync_calls["to"] = kwargs
+        def sync_from(self, *_args, **kwargs):
+            sync_calls["from"] = kwargs
 
     monkeypatch.setattr("autoprogramming.pi_worker.RemoteExecutor", FakeRemote)
     target = ap.RemoteCompute(endpoint="gpu-box", transport="ssh", workdir="/remote/ap")
@@ -261,12 +266,111 @@ def test_worker_uses_remote_tools_only_when_user_provides_target(
     invocation = json.loads((work / "invocation.json").read_text())
     assert invocation["remote"] == "gpu-box"
     assert invocation["remote_cwd"] == "/remote/ap/task"
+    assert "UV_CACHE_DIR=/remote/ap/task-uv-cache" in invocation["remote_prefix"]
+    assert ".venv-*" in sync_calls["to"]["excludes"]
+    assert sync_calls["from"]["excludes"] == sync_calls["to"]["excludes"]
     extensions = [
         invocation["argv"][i + 1]
         for i, arg in enumerate(invocation["argv"][:-1])
         if arg == "--extension"
     ]
     assert any(path.endswith("remote-worker.ts") for path in extensions)
+
+
+def test_worker_cache_cleanup_is_guarded_and_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setenv("AP_WORKER_DIR", str(tmp_path / "ap-work"))
+    schema = Schema.from_function(pi_solve)
+    rows = [{"text": "x", "PiOutput": "x"}]
+    workspace = Workspace.create(
+        tmp_path / "cleanup_ap", schema,
+        {"train": rows, "val": rows, "test": rows},
+        seed=0, ratios=(0.6, 0.2, 0.2), data_sha="cleanup", bootstrap=True,
+    )
+    run_root = worker_run_dir(workspace)
+    venv = run_root / "avenue" / ".venv"
+    venv.mkdir(parents=True)
+    (venv / "package.bin").write_bytes(b"cache")
+    uv_cache = run_root / ".uv-cache"
+    uv_cache.mkdir()
+    (uv_cache / "archive").write_bytes(b"uv")
+
+    with pytest.raises(RunnerError, match="unfinished"):
+        cleanup_worker_cache(workspace)
+    assert run_root.exists()
+    forced = cleanup_worker_cache(workspace, force=True)
+    assert forced["removed"] is True
+
+    run_root = worker_run_dir(workspace)
+    (run_root / ".uv-cache").mkdir()
+    (run_root / ".uv-cache" / "archive").write_bytes(b"new")
+    workspace.mark_finalized({"activated": "candidate_0"})
+    result = cleanup_worker_cache(workspace)
+    assert result["bytes_removed"] >= 3
+    assert result["removed"] is True
+    assert not run_root.exists()
+    again = cleanup_worker_cache(workspace)
+    assert again["bytes_removed"] == 0
+    assert again["removed"] is True
+
+
+def test_worker_cache_cleanup_removes_remote_scratch(tmp_path, monkeypatch):
+    import autoprogramming as ap
+
+    monkeypatch.setenv("AP_WORKER_DIR", str(tmp_path / "ap-work"))
+    schema = Schema.from_function(pi_solve)
+    rows = [{"text": "x", "PiOutput": "x"}]
+    workspace = Workspace.create(
+        tmp_path / "remote_cleanup_ap", schema,
+        {"train": rows, "val": rows, "test": rows},
+        seed=0, ratios=(0.6, 0.2, 0.2), data_sha="remote-cleanup",
+        bootstrap=True,
+    )
+    worker_run_dir(workspace).mkdir(exist_ok=True)
+    workspace.mark_finalized({"activated": "candidate_0"})
+    workspace.portfolio_json.parent.mkdir(parents=True, exist_ok=True)
+    workspace.portfolio_json.write_text("{}\n")
+    remote = ap.RemoteCompute(
+        endpoint="gpu-box", transport="ssh", workdir="/remote/ap"
+    )
+    spec = SimpleNamespace(
+        id="deep-model",
+        tier=ApproachTier.SPECIALIZED_DEEP_MODEL,
+        required_capabilities=(),
+        required_mechanisms=(),
+    )
+    fake_portfolio = SimpleNamespace(
+        resources=SimpleNamespace(
+            search=SimpleNamespace(remote_compute=remote)
+        ),
+        avenues=[SimpleNamespace(spec=spec)],
+    )
+    monkeypatch.setattr(
+        Portfolio, "load", classmethod(lambda _cls, _path: fake_portfolio)
+    )
+    commands = []
+
+    class FakeRemoteExecutor:
+        def __init__(self, config):
+            assert config is remote
+        def staged_dir(self, local_root, *, namespace):
+            assert namespace == "deep-model"
+            return "/remote/ap/run/deep-model"
+        def ssh(self, command):
+            commands.append(command)
+
+    monkeypatch.setattr(
+        "autoprogramming.pi_worker.RemoteExecutor", FakeRemoteExecutor
+    )
+    result = cleanup_worker_cache(workspace)
+    assert result["remote_errors"] == []
+    assert result["remote_removed"] == [
+        "/remote/ap/run/deep-model",
+        "/remote/ap/run/deep-model-uv-cache",
+    ]
+    assert commands == [
+        "rm -rf -- /remote/ap/run/deep-model "
+        "/remote/ap/run/deep-model-uv-cache"
+    ]
 
 
 def test_bundle_import_replaces_orphan_from_pre_candidate_crash(tmp_path):

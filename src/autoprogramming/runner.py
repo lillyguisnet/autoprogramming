@@ -16,6 +16,7 @@ which is reserved for the harness itself failing (e.g. uv missing).
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import queue
@@ -52,6 +53,11 @@ import json
 import math
 import sys
 import traceback
+
+_AP_CONFIG = json.loads(sys.argv[1])
+_CANDIDATE_PATH = _AP_CONFIG["candidate_path"]
+_PARENT_DIR = _AP_CONFIG["parent_dir"]
+_OUTPUT_SPEC = _AP_CONFIG["output_spec"]
 
 sys.path.insert(0, _PARENT_DIR)
 
@@ -95,7 +101,7 @@ def _map_outputs(value):
 
 
 def _main():
-    with open(sys.argv[1], encoding="utf-8") as fh:
+    with open(sys.argv[2], encoding="utf-8") as fh:
         inputs = json.load(fh)
     try:
         module = _load_candidate()
@@ -111,7 +117,7 @@ def _main():
         payload = {"ok": True, "outputs": outputs, "cost_dollars": cost}
     except Exception:
         payload = {"ok": False, "error": traceback.format_exc()}
-    with open(_RESULT_PATH, "w", encoding="utf-8") as fh:
+    with open(sys.argv[3], "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
 
 
@@ -126,6 +132,11 @@ import os
 import sys
 import time
 import traceback
+
+_AP_CONFIG = json.loads(sys.argv[1])
+_CANDIDATE_PATH = _AP_CONFIG["candidate_path"]
+_PARENT_DIR = _AP_CONFIG["parent_dir"]
+_OUTPUT_SPEC = _AP_CONFIG["output_spec"]
 
 sys.path.insert(0, _PARENT_DIR)
 _BASES = {
@@ -215,6 +226,12 @@ import math
 import sys
 import time
 import traceback
+
+_AP_CONFIG = json.loads(sys.argv[1])
+_CANDIDATE_PATH = _AP_CONFIG["candidate_path"]
+_PARENT_DIR = _AP_CONFIG["parent_dir"]
+_OUTPUT_SPEC = _AP_CONFIG["output_spec"]
+_PROTOCOL_PREFIX = _AP_CONFIG["protocol_prefix"]
 
 sys.path.insert(0, _PARENT_DIR)
 _BASES = {
@@ -387,18 +404,58 @@ def _driver_source(
     candidate: Candidate,
     deps: tuple[str, ...],
     dist_name: str,
-    parent_dir: str,
-    output_spec: list[dict],
-    result_path: str | Path,
+) -> str:
+    """Stable one-shot driver source for one dependency manifest.
+
+    Runtime paths and schema details are command arguments, not source text. This
+    is important because uv keys a PEP 723 environment by script path: a UUID
+    script for every call leaves one dead cached environment per call.
+    """
+    block = _driver_pep723(candidate, deps, dist_name) if deps else ""
+    return block + _DRIVER_BODY
+
+
+def _session_driver_source(
+    candidate: Candidate, deps: tuple[str, ...], dist_name: str, *, remote: bool = False
 ) -> str:
     block = _driver_pep723(candidate, deps, dist_name) if deps else ""
-    prelude = (
-        f"_CANDIDATE_PATH = {str(Path(candidate.path).resolve())!r}\n"
-        f"_PARENT_DIR = {parent_dir!r}\n"
-        f"_OUTPUT_SPEC = {output_spec!r}\n"
-        f"_RESULT_PATH = {str(result_path)!r}\n"
-    )
-    return block + prelude + _DRIVER_BODY
+    return block + (_REMOTE_SESSION_DRIVER_BODY if remote else _SESSION_DRIVER_BODY)
+
+
+def _runtime_config(
+    candidate: Candidate,
+    parent_dir: str,
+    output_spec: list[dict],
+    *,
+    protocol_prefix: str | None = None,
+) -> str:
+    config: dict[str, object] = {
+        "candidate_path": str(Path(candidate.path).resolve()),
+        "parent_dir": parent_dir,
+        "output_spec": output_spec,
+    }
+    if protocol_prefix is not None:
+        config["protocol_prefix"] = protocol_prefix
+    return json.dumps(config, separators=(",", ":"))
+
+
+def _stable_driver_path(tmp_dir: Path, kind: str, source: str) -> Path:
+    """Materialize a concurrency-safe driver at a content-stable path."""
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:20]
+    path = tmp_dir / f"ap_{kind}_{digest}.py"
+    try:
+        if path.read_text(encoding="utf-8") == source:
+            return path
+    except OSError:
+        pass
+    temporary = tmp_dir / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    temporary.write_text(source, encoding="utf-8")
+    try:
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(OSError):
+            temporary.unlink(missing_ok=True)
+    return path
 
 
 def _as_text(value: object) -> str:
@@ -462,9 +519,16 @@ def run_candidate(
         )
 
     token = uuid.uuid4().hex
-    driver_path = tmp_dir / f"driver_{token}.py"
+    driver_source = _driver_source(candidate, deps, workspace.dist_name)
+    persistent_driver = bool(deps)
+    if persistent_driver:
+        driver_path = _stable_driver_path(tmp_dir, "run", driver_source)
+    else:
+        driver_path = tmp_dir / f"driver_{token}.py"
+        driver_path.write_text(driver_source, encoding="utf-8")
     inputs_path = tmp_dir / f"inputs_{token}.json"
     result_path = tmp_dir / f"result_{token}.json"
+    config = _runtime_config(candidate, parent_dir, output_spec)
 
     env = os.environ.copy()
     env.pop("PI_SESSION_ID", None)
@@ -474,21 +538,15 @@ def run_candidate(
     env["PYTHONPATH"] = parent_dir + (os.pathsep + existing if existing else "")
     env["AP_WORKSPACE"] = str(root)
 
+    driver_args = [str(driver_path), config, str(inputs_path), str(result_path)]
     if deps:
-        cmd = ["uv", "run", "--no-project", "--quiet", str(driver_path), str(inputs_path)]
+        cmd = ["uv", "run", "--no-project", "--quiet", *driver_args]
     else:
-        cmd = [sys.executable, str(driver_path), str(inputs_path)]
+        cmd = [sys.executable, *driver_args]
 
     start = time.monotonic()
     payload_text: str | None = None
     try:
-        driver_path.write_text(
-            _driver_source(
-                candidate, deps, workspace.dist_name, parent_dir, output_spec,
-                result_path,
-            ),
-            encoding="utf-8",
-        )
         inputs_path.write_text(json.dumps(inputs), encoding="utf-8")
         try:
             proc = subprocess.Popen(
@@ -526,7 +584,10 @@ def run_candidate(
         if result_path.exists():
             payload_text = result_path.read_text(encoding="utf-8")
     finally:
-        for path in (driver_path, inputs_path, result_path):
+        cleanup_paths = [inputs_path, result_path]
+        if not persistent_driver:
+            cleanup_paths.append(driver_path)
+        for path in cleanup_paths:
             with contextlib.suppress(OSError):
                 path.unlink(missing_ok=True)
 
@@ -610,6 +671,7 @@ class CandidateSession:
         self.timeout = timeout
         self._proc: subprocess.Popen | None = None
         self._driver_path: Path | None = None
+        self._persistent_driver = False
         self._tmp_paths: set[Path] = set()
         self._stdout: list[str] = []
         self._stderr: list[str] = []
@@ -641,19 +703,24 @@ class CandidateSession:
                 f"Cannot run {self.candidate.name}: it declares third-party "
                 "dependencies but uv was not found on PATH."
             )
-        token = uuid.uuid4().hex
-        self._driver_path = tmp_dir / f"session_driver_{token}.py"
-        block = _driver_pep723(self.candidate, deps, self.workspace.dist_name) if deps else ""
-        prelude = (
-            f"_CANDIDATE_PATH = {str(Path(self.candidate.path).resolve())!r}\n"
-            f"_PARENT_DIR = {parent_dir!r}\n"
-            f"_OUTPUT_SPEC = {output_spec!r}\n"
+        source = _session_driver_source(
+            self.candidate, deps, self.workspace.dist_name
         )
-        self._driver_path.write_text(block + prelude + _SESSION_DRIVER_BODY, encoding="utf-8")
+        self._persistent_driver = bool(deps)
+        if self._persistent_driver:
+            self._driver_path = _stable_driver_path(tmp_dir, "session", source)
+        else:
+            token = uuid.uuid4().hex
+            self._driver_path = tmp_dir / f"session_driver_{token}.py"
+            self._driver_path.write_text(source, encoding="utf-8")
+        config = _runtime_config(self.candidate, parent_dir, output_spec)
         cmd = (
-            ["uv", "run", "--no-project", "--quiet", str(self._driver_path)]
+            [
+                "uv", "run", "--no-project", "--quiet",
+                str(self._driver_path), config,
+            ]
             if deps
-            else [sys.executable, str(self._driver_path)]
+            else [sys.executable, str(self._driver_path), config]
         )
         env = os.environ.copy()
         env.pop("PI_SESSION_ID", None)
@@ -803,7 +870,7 @@ class CandidateSession:
 
     def _cleanup_files(self) -> None:
         paths = list(self._tmp_paths)
-        if self._driver_path is not None:
+        if self._driver_path is not None and not self._persistent_driver:
             paths.append(self._driver_path)
         for path in paths:
             with contextlib.suppress(OSError):
@@ -835,6 +902,7 @@ class RemoteCandidateSession:
         self.executor = RemoteExecutor(remote, timeout=max(timeout, 120.0))
         self._proc: subprocess.Popen | None = None
         self._driver_path: Path | None = None
+        self._persistent_driver = False
         self._responses: queue.Queue[dict] = queue.Queue()
         self._stdout: list[str] = []
         self._stderr: list[str] = []
@@ -857,8 +925,6 @@ class RemoteCandidateSession:
         root = Path(self.workspace.root).resolve()
         tmp_dir = Path(self.workspace.tmp_dir)
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        token = uuid.uuid4().hex
-        self._driver_path = tmp_dir / f"remote_session_driver_{token}.py"
         staged_parent = self.executor.staged_dir(
             root, namespace=f"evaluation-{self.candidate.name}"
         )
@@ -873,17 +939,22 @@ class RemoteCandidateSession:
             for f in self.workspace.schema.outputs
         ]
         deps = runtime_deps(self.candidate, self.workspace.dist_name)
-        block = _driver_pep723(self.candidate, deps, self.workspace.dist_name) if deps else ""
-        prelude = (
-            f"_CANDIDATE_PATH = {remote_candidate!r}\n"
-            f"_PARENT_DIR = {remote_parent!r}\n"
-            f"_OUTPUT_SPEC = {output_spec!r}\n"
-            f"_PROTOCOL_PREFIX = {self._prefix!r}\n"
+        source = _session_driver_source(
+            self.candidate, deps, self.workspace.dist_name, remote=True
         )
-        self._driver_path.write_text(
-            block + prelude + _REMOTE_SESSION_DRIVER_BODY,
-            encoding="utf-8",
-        )
+        self._persistent_driver = bool(deps)
+        if self._persistent_driver:
+            self._driver_path = _stable_driver_path(tmp_dir, "remote_session", source)
+        else:
+            token = uuid.uuid4().hex
+            self._driver_path = tmp_dir / f"remote_session_driver_{token}.py"
+            self._driver_path.write_text(source, encoding="utf-8")
+        config = json.dumps({
+            "candidate_path": remote_candidate,
+            "parent_dir": remote_parent,
+            "output_spec": output_spec,
+            "protocol_prefix": self._prefix,
+        }, separators=(",", ":"))
         self.executor.sync_to(
             root,
             remote_root,
@@ -905,9 +976,10 @@ class RemoteCandidateSession:
         )
         remote_driver = f"{remote_root}/.ap/{self._driver_path.name}"
         executable = (
-            f"uv run --no-project --quiet {shlex.quote(remote_driver)}"
+            f"uv run --no-project --quiet {shlex.quote(remote_driver)} "
+            f"{shlex.quote(config)}"
             if deps
-            else f"python3 {shlex.quote(remote_driver)}"
+            else f"python3 {shlex.quote(remote_driver)} {shlex.quote(config)}"
         )
         environment = gpu_environment_prefix(self.remote)
         exported = f"export {environment}; " if environment else ""
@@ -1052,7 +1124,7 @@ class RemoteCandidateSession:
         self._cleanup()
 
     def _cleanup(self) -> None:
-        if self._driver_path is not None:
+        if self._driver_path is not None and not self._persistent_driver:
             with contextlib.suppress(OSError):
                 self._driver_path.unlink(missing_ok=True)
 

@@ -251,7 +251,12 @@ approach failure. If remote access breaks, consult the user.
       # ///
 
   stdlib-only candidates need no block at all. Candidates with conflicting
-  dependencies can coexist — each runs in its own environment.
+  dependencies can coexist — each runs in its own environment. The harness uses
+  stable dependency-keyed drivers so UV reuses those environments. Do not create
+  a `.venv` per candidate or experiment. For a direct package test, use the
+  candidate's stable script path
+  with `uv run candidates/candidate_<n>.py`; remove any throwaway environment
+  before finishing.
 - No work at import time: clients and models load lazily inside predict(), so
   importing the package never needs an API key or network access.
 - **Never add a cross-family safety fallback.** Provider/model retries and robust
@@ -299,7 +304,8 @@ approach failure. If remote access breaks, consult the user.
 5. **prg.finalize()** — one-time test eval, activation under the precommitted
    frontier preference, sealed report. Present the tradeoff frontier to the user and
    the one-liner to switch to a cheaper/faster alternative. Do not skip finalize:
-   an un-finalized workspace ships nothing.
+   an un-finalized workspace ships nothing. Orchestrated runs clean their owned
+   worker UV cache at this point; paused runs retain it for resume.
 
 ## Budget honesty
 

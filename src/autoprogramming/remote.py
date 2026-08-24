@@ -231,11 +231,23 @@ class RemoteExecutor:
             detail = (tar_err + ssh_err + ssh_out).decode("utf-8", "replace")[-2000:]
             raise RunnerError(f"Failed to stage remote compute directory: {detail}")
 
-    def sync_from(self, remote_root: str, local_root: str | Path) -> None:
+    def sync_from(
+        self,
+        remote_root: str,
+        local_root: str | Path,
+        *,
+        excludes: tuple[str, ...] = (),
+    ) -> None:
         """Pull a worker tree transactionally, including remote deletions."""
         local = Path(local_root).resolve()
         local.mkdir(parents=True, exist_ok=True)
-        remote_command = f"test -d {_q(remote_root)} && tar -czf - -C {_q(remote_root)} ."
+        exclude_args = " ".join(
+            f"--exclude={_q(item)}" for item in excludes
+        )
+        remote_command = (
+            f"test -d {_q(remote_root)} && tar -czf - {exclude_args} "
+            f"-C {_q(remote_root)} ."
+        )
         with tempfile.TemporaryDirectory(
             prefix="ap-remote-pull-", dir=str(local.parent)
         ) as temp_name:

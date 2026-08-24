@@ -203,6 +203,10 @@ frontier point.
 Workers never receive optimizer identity, metric names/code/weights, leaderboard
 scores, other workers, val, or test. They see a generic function task, dev-fit
 examples, one assigned mechanism, permitted resources, and their own prior files.
+Worker `uv` operations use an AutoProgramming-owned cache under
+`~/.cache/ap-work/<run>/`; do not create a new virtual environment for each
+experiment. Reuse one task-local `.venv` only when package execution is necessary,
+and keep required runtime files in the declared artifact namespace instead.
 
 **Mechanism fidelity is absolute.** An avenue may fail, be blocked, or score
 poorly, but it may never substitute another approach family to keep the function
@@ -266,6 +270,11 @@ What happens mechanically:
   explicit human agreement may you use `"exclude"`. Then resume `optimize()`.
 - Returns a `FinalReport` when candidates were scored; `None` when the
   workspace is awaiting metric approval, blocker resolution, or a manual session.
+- Successful finalization automatically removes local and remote worker virtual
+  environments and UV scratch. Paused, blocked, and budget-exhausted runs retain
+  it for repair/resume. To deliberately abandon such resume state, use
+  `prg.cleanup_search_cache(force=True)`. This never removes materialized
+  candidates or runtime artifacts from the workspace.
 
 Afterwards the program is a normal function and a normal package:
 

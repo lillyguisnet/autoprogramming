@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -266,6 +267,33 @@ def test_finalize_happy_path(tmp_path):
     assert ws.final_report.exists()
     stored = json.loads(ws.final_report.read_text())
     assert stored["activated"] == "candidate_0"
+
+
+def test_finalize_cleans_orchestrated_worker_cache(tmp_path, monkeypatch):
+    from autoprogramming.portfolio import Portfolio
+
+    ws = make_workspace(tmp_path)
+    approve_metric(ws)
+    h = harness.AgentHarness(ws)
+    h.new_candidate(source=GOOD_CANDIDATE)
+    h.eval("candidate_0", n_repeats=1)
+    ws.portfolio_json.parent.mkdir(parents=True, exist_ok=True)
+    ws.portfolio_json.write_text("{}\n")
+    fake_portfolio = SimpleNamespace(
+        may_finalize=True, unresolved_blockers=[], avenues=[]
+    )
+    monkeypatch.setattr(
+        Portfolio, "load", classmethod(lambda _cls, _path: fake_portfolio)
+    )
+    calls = []
+    monkeypatch.setattr(
+        harness.AgentHarness,
+        "cleanup_search_cache",
+        lambda self, **kwargs: calls.append(kwargs) or {"remote_errors": []},
+    )
+
+    h.finalize()
+    assert calls == [{}]
 
 
 def test_finalize_refuses_second_run(tmp_path):
