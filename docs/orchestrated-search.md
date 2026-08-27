@@ -137,10 +137,12 @@ The implementation is split by responsibility: `pi_rpc.py` owns JSONL/RPC
 framing and usage collection, `pi_worker.py` owns implementation task bundles,
 environment scrubbing, run-owned UV cache placement, worker process launch, and
 scratch cleanup, while `pi_backend.py` is the trusted portfolio controller.
-Worker state remains under `$AP_WORKER_DIR` (default `~/.cache/ap-work`) while a
-run can resume. Finalization removes it after candidates and declared artifacts
-are materialized. Remote transfer excludes task-local virtual environments and
-remote UV scratch; finalization removes the corresponding remote paths too.
+Worker state remains under `$AP_WORKER_DIR` (default `~/.cache/ap-work`) for
+repair, diagnostics, and downstream evaluation. Finalization removes only owned
+UV caches and disposable `.venv*` directories. Remote transfer excludes those
+package environments, and remote evaluation uses a workspace-owned UV cache so
+finalization can remove it without deleting staged source, artifacts, outputs,
+or inactive-candidate diagnostics.
 
 Inside a live Pi conversation, Python does not launch strategy RPC at all. The
 host uses `prg.web_search`, `plan_portfolio`, `orchestrate_portfolio`, and

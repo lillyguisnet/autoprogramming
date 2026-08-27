@@ -304,8 +304,9 @@ approach failure. If remote access breaks, consult the user.
 5. **prg.finalize()** — one-time test eval, activation under the precommitted
    frontier preference, sealed report. Present the tradeoff frontier to the user and
    the one-liner to switch to a cheaper/faster alternative. Do not skip finalize:
-   an un-finalized workspace ships nothing. Orchestrated runs clean their owned
-   worker UV cache at this point; paused runs retain it for resume.
+   an un-finalized workspace ships nothing. Orchestrated runs clean only their
+   owned UV caches and disposable package environments at this point; candidate
+   diagnostics remain available, and paused runs retain package caches for resume.
 
 ## Budget honesty
 

@@ -477,23 +477,55 @@ def avenue_dir(workspace, avenue_id: str) -> Path:
 
 def _tree_size(path: Path) -> int:
     total = 0
-    if not path.exists():
+    if not path.exists() or path.is_symlink():
         return total
-    for root, _dirs, files in os.walk(path):
+    for current, _dirs, files in os.walk(path):
         for name in files:
             try:
-                total += (Path(root) / name).stat().st_size
+                total += (Path(current) / name).stat().st_size
             except OSError:
                 pass
     return total
 
 
-def cleanup_worker_cache(workspace, *, force: bool = False) -> dict:
-    """Remove one run's local and remote worker scratch.
+def _is_worker_environment(name: str) -> bool:
+    return (
+        name == ".uv-cache"
+        or name == ".venv"
+        or name.startswith(".venv-")
+        or name.startswith(".venv_")
+    )
 
-    Unfinished runs retain their worker files by default because repair and
-    deepening turns resume from ``solution.py`` and task-local artifacts.
-    ``force=True`` is therefore an explicit abandonment operation.
+
+def _local_worker_caches(root: Path) -> list[Path]:
+    """Cache/environment directories only; never candidate diagnostics."""
+    if not root.exists():
+        return []
+    if root.is_symlink():
+        raise RunnerError(f"Refusing to traverse symlinked worker root {root}.")
+    result: list[Path] = []
+    for current, dirs, _files in os.walk(root, topdown=True, followlinks=False):
+        for name in tuple(dirs):
+            if not _is_worker_environment(name):
+                continue
+            result.append(Path(current) / name)
+            dirs.remove(name)
+    return result
+
+
+def _remove_cache_directory(path: Path) -> None:
+    if path.is_symlink():
+        path.unlink(missing_ok=True)
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def cleanup_worker_cache(workspace, *, force: bool = False) -> dict:
+    """Remove only owned UV caches and disposable virtual environments.
+
+    Worker source, task files, artifacts, output caches, and inactive-candidate
+    diagnostics are always preserved. Unfinished runs require ``force=True`` so
+    an active package setup is not removed while it is in use.
     """
     try:
         finalized = bool(workspace.active.get("finalized"))
@@ -502,7 +534,8 @@ def cleanup_worker_cache(workspace, *, force: bool = False) -> dict:
     if not finalized and not force:
         raise RunnerError(
             "Refusing to remove worker cache for an unfinished search. Finalize "
-            "the workspace first, or pass force=True to abandon worker resume state."
+            "the workspace first, or pass force=True to discard only its package "
+            "cache and disposable virtual environments."
         )
 
     base = worker_cache_base().resolve()
@@ -522,7 +555,10 @@ def cleanup_worker_cache(workspace, *, force: bool = False) -> dict:
             remote = portfolio.resources.search.remote_compute
             if remote is not None:
                 executor = RemoteExecutor(remote)
-                targets: list[str] = []
+                worker_roots: list[str] = []
+                cache_targets: list[str] = [
+                    f"{executor.staged_root(workspace.root)}/.uv-cache"
+                ]
                 for avenue in portfolio.avenues:
                     if not use_remote_for_avenue(avenue.spec):
                         continue
@@ -530,26 +566,41 @@ def cleanup_worker_cache(workspace, *, force: bool = False) -> dict:
                     remote_root = executor.staged_dir(
                         local_avenue, namespace=local_avenue.name
                     )
-                    targets.extend((remote_root, f"{remote_root}-uv-cache"))
-                if targets:
-                    executor.ssh(
-                        "rm -rf -- " + " ".join(shlex.quote(v) for v in targets)
+                    worker_roots.append(remote_root)
+                    cache_targets.append(f"{remote_root}-uv-cache")
+                cache_targets = list(dict.fromkeys(cache_targets))
+                # Stage roots contain implementation and inactive-candidate
+                # diagnostics. Delete only exact cache paths and named venvs.
+                commands = [
+                    "rm -rf -- "
+                    + " ".join(shlex.quote(value) for value in cache_targets)
+                ]
+                for remote_root in worker_roots:
+                    quoted = shlex.quote(remote_root)
+                    commands.append(
+                        f"if [ -d {quoted} ]; then find {quoted} -mindepth 1 "
+                        "-maxdepth 1 "
+                        "\\( -name .venv -o -name '.venv-*' -o "
+                        "-name '.venv_*' -o -name .uv-cache \\) "
+                        "-exec rm -rf -- {} +; fi"
                     )
-                    remote_removed.extend(targets)
+                executor.ssh("; ".join(commands))
+                remote_removed.extend(cache_targets)
         except Exception as exc:
             # Finalization is already durable. A disconnected optional compute
             # target must not turn cache hygiene into a failed program result.
             remote_errors.append(str(exc))
 
-    bytes_removed = 0 if root.is_symlink() else _tree_size(root)
-    if root.is_symlink():
-        root.unlink(missing_ok=True)
-    elif root.exists():
-        shutil.rmtree(root)
+    local_caches = _local_worker_caches(root)
+    bytes_removed = sum(_tree_size(path) for path in local_caches)
+    for path in local_caches:
+        _remove_cache_directory(path)
     return {
         "path": str(root),
         "bytes_removed": bytes_removed,
-        "removed": not root.exists(),
+        "removed": all(not path.exists() for path in local_caches),
+        "cache_paths_removed": [str(path) for path in local_caches],
+        "preserved_worker_root": root.exists(),
         "remote_removed": remote_removed,
         "remote_errors": remote_errors,
     }

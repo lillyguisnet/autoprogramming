@@ -270,11 +270,12 @@ What happens mechanically:
   explicit human agreement may you use `"exclude"`. Then resume `optimize()`.
 - Returns a `FinalReport` when candidates were scored; `None` when the
   workspace is awaiting metric approval, blocker resolution, or a manual session.
-- Successful finalization automatically removes local and remote worker virtual
-  environments and UV scratch. Paused, blocked, and budget-exhausted runs retain
-  it for repair/resume. To deliberately abandon such resume state, use
-  `prg.cleanup_search_cache(force=True)`. This never removes materialized
-  candidates or runtime artifacts from the workspace.
+- Successful finalization automatically removes only owned local/remote UV
+  caches and disposable worker `.venv*` directories. Paused, blocked, and
+  budget-exhausted runs retain them unless the user requests
+  `prg.cleanup_search_cache(force=True)`. Candidate source, artifacts, outputs,
+  and inactive-candidate diagnostics always remain available for downstream
+  evaluation.
 
 Afterwards the program is a normal function and a normal package:
 

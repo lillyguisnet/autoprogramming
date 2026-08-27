@@ -249,9 +249,10 @@ uv run candidates/candidate_0.py "Hello, how are you?"
 - **The packager reads the same block.** No parallel metadata format to keep in sync — the active candidate's `dependencies` list *is* the package's dependency list.
 
 Implementation workers use an AutoProgramming-owned UV cache under
-`~/.cache/ap-work/<run>/`. Successful finalization removes that local/remote
-scratch automatically; paused runs retain it for resume. For a deliberately
-abandoned run, attach to the workspace and call
+`~/.cache/ap-work/<run>/`. Successful finalization removes only owned local and
+remote UV caches and disposable `.venv*` directories. Worker source, artifacts,
+outputs, and inactive-candidate diagnostics remain available for downstream
+evaluation. Paused runs retain package caches unless you explicitly call
 `prg.cleanup_search_cache(force=True)`. Existing global UV cache left by older
 versions can be reclaimed once with `uv cache prune`.
 

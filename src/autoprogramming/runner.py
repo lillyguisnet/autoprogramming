@@ -925,9 +925,11 @@ class RemoteCandidateSession:
         root = Path(self.workspace.root).resolve()
         tmp_dir = Path(self.workspace.tmp_dir)
         tmp_dir.mkdir(parents=True, exist_ok=True)
+        staged_owner = self.executor.staged_root(root)
         staged_parent = self.executor.staged_dir(
             root, namespace=f"evaluation-{self.candidate.name}"
         )
+        remote_uv_cache = f"{staged_owner}/.uv-cache"
         # Preserve the workspace's importable package basename remotely: a
         # candidate may import `<workspace>.schema` or `<workspace>.paths`.
         remote_root = f"{staged_parent}/{root.name}"
@@ -981,8 +983,13 @@ class RemoteCandidateSession:
             if deps
             else f"python3 {shlex.quote(remote_driver)} {shlex.quote(config)}"
         )
-        environment = gpu_environment_prefix(self.remote)
-        exported = f"export {environment}; " if environment else ""
+        environment = " ".join(
+            value for value in (
+                gpu_environment_prefix(self.remote),
+                f"UV_CACHE_DIR={shlex.quote(remote_uv_cache)}",
+            ) if value
+        )
+        exported = f"export {environment}; "
         command = (
             f"cd {shlex.quote(remote_root)} && {exported}exec {executable}"
         )

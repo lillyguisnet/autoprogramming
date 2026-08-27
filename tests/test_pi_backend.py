@@ -287,33 +287,46 @@ def test_worker_cache_cleanup_is_guarded_and_idempotent(tmp_path, monkeypatch):
         seed=0, ratios=(0.6, 0.2, 0.2), data_sha="cleanup", bootstrap=True,
     )
     run_root = worker_run_dir(workspace)
-    venv = run_root / "avenue" / ".venv"
+    avenue = run_root / "avenue"
+    venv = avenue / ".venv"
     venv.mkdir(parents=True)
     (venv / "package.bin").write_bytes(b"cache")
     uv_cache = run_root / ".uv-cache"
     uv_cache.mkdir()
     (uv_cache / "archive").write_bytes(b"uv")
+    solution = avenue / "solution.py"
+    solution.write_text("def predict(text): return text\n")
+    diagnostics = avenue / ".ap" / "inactive_artifacts" / "candidate_1"
+    diagnostics.mkdir(parents=True)
+    (diagnostics / "trace.jsonl").write_text("diagnostic\n")
 
     with pytest.raises(RunnerError, match="unfinished"):
         cleanup_worker_cache(workspace)
     assert run_root.exists()
     forced = cleanup_worker_cache(workspace, force=True)
     assert forced["removed"] is True
+    assert forced["preserved_worker_root"] is True
+    assert not venv.exists()
+    assert not uv_cache.exists()
+    assert solution.exists()
+    assert (diagnostics / "trace.jsonl").read_text() == "diagnostic\n"
 
-    run_root = worker_run_dir(workspace)
-    (run_root / ".uv-cache").mkdir()
-    (run_root / ".uv-cache" / "archive").write_bytes(b"new")
+    uv_cache.mkdir()
+    (uv_cache / "archive").write_bytes(b"new")
     workspace.mark_finalized({"activated": "candidate_0"})
     result = cleanup_worker_cache(workspace)
     assert result["bytes_removed"] >= 3
     assert result["removed"] is True
-    assert not run_root.exists()
+    assert run_root.exists()
+    assert solution.exists()
+    assert diagnostics.exists()
     again = cleanup_worker_cache(workspace)
     assert again["bytes_removed"] == 0
     assert again["removed"] is True
+    assert again["preserved_worker_root"] is True
 
 
-def test_worker_cache_cleanup_removes_remote_scratch(tmp_path, monkeypatch):
+def test_worker_cache_cleanup_removes_only_remote_caches(tmp_path, monkeypatch):
     import autoprogramming as ap
 
     monkeypatch.setenv("AP_WORKER_DIR", str(tmp_path / "ap-work"))
@@ -352,6 +365,8 @@ def test_worker_cache_cleanup_removes_remote_scratch(tmp_path, monkeypatch):
     class FakeRemoteExecutor:
         def __init__(self, config):
             assert config is remote
+        def staged_root(self, local_root):
+            return "/remote/ap/workspace"
         def staged_dir(self, local_root, *, namespace):
             assert namespace == "deep-model"
             return "/remote/ap/run/deep-model"
@@ -364,13 +379,16 @@ def test_worker_cache_cleanup_removes_remote_scratch(tmp_path, monkeypatch):
     result = cleanup_worker_cache(workspace)
     assert result["remote_errors"] == []
     assert result["remote_removed"] == [
-        "/remote/ap/run/deep-model",
+        "/remote/ap/workspace/.uv-cache",
         "/remote/ap/run/deep-model-uv-cache",
     ]
-    assert commands == [
-        "rm -rf -- /remote/ap/run/deep-model "
-        "/remote/ap/run/deep-model-uv-cache"
-    ]
+    assert len(commands) == 1
+    assert commands[0].startswith(
+        "rm -rf -- /remote/ap/workspace/.uv-cache "
+        "/remote/ap/run/deep-model-uv-cache; "
+    )
+    assert "find /remote/ap/run/deep-model" in commands[0]
+    assert "rm -rf -- /remote/ap/run/deep-model " not in commands[0]
 
 
 def test_bundle_import_replaces_orphan_from_pre_candidate_crash(tmp_path):

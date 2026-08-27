@@ -435,6 +435,52 @@ def test_uv_drivers_are_stable_per_dependency_manifest(tmp_path, monkeypatch):
     assert not list(Path(ws.tmp_dir).glob("session_driver_*.py"))
 
 
+def test_remote_candidate_uses_workspace_owned_uv_cache(tmp_path, monkeypatch):
+    import autoprogramming as ap
+
+    ws = make_ws(tmp_path)
+    target = ap.RemoteCompute(
+        endpoint="gpu-box", transport="ssh", workdir="/remote/ap"
+    )
+    resources = ap.Resources(
+        search=ap.SearchResources(
+            allow_package_installs=True,
+            allow_model_downloads=True,
+            candidate_api_providers=(),
+            remote_compute=target,
+        ),
+        runtime=ap.RuntimeResources(network=False),
+        data=ap.DataPolicy(external_egress=False),
+        confirmed=True,
+    )
+    ws.resources_json = ws.root / "resources.json"
+    ws.resources_json.write_text(json.dumps(resources.to_dict()))
+    cand = write_candidate(ws, UPPER)
+
+    class FakeRemoteExecutor:
+        def __init__(self, config, **kwargs):
+            assert config == target
+        def staged_root(self, local_root):
+            return "/remote/ap/workspace-owner"
+        def staged_dir(self, local_root, *, namespace):
+            assert namespace == "evaluation-candidate_0"
+            return "/remote/ap/workspace-owner/evaluation-candidate_0"
+        def sync_to(self, *args, **kwargs):
+            return None
+
+    commands = []
+
+    def fail_popen(command, **kwargs):
+        commands.append(command)
+        raise FileNotFoundError("test stop")
+
+    monkeypatch.setattr(runner, "RemoteExecutor", FakeRemoteExecutor)
+    monkeypatch.setattr(runner.subprocess, "Popen", fail_popen)
+    with pytest.raises(RunnerError, match="Could not launch remote candidate"):
+        runner.RemoteCandidateSession(ws, cand).start()
+    assert "UV_CACHE_DIR=/remote/ap/workspace-owner/.uv-cache" in commands[0][2]
+
+
 def test_tmp_dir_cleaned_up(tmp_path):
     ws = make_ws(tmp_path)
     cand = write_candidate(ws, UPPER)

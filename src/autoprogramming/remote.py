@@ -174,14 +174,18 @@ class RemoteExecutor:
         self._base = base
         return base
 
-    def staged_dir(self, local_root: str | Path, *, namespace: str = "work") -> str:
+    def staged_root(self, local_root: str | Path) -> str:
+        """Stable remote owner directory for one local workspace/task root."""
         identity = hashlib.sha256(
             str(Path(local_root).resolve()).encode("utf-8")
         ).hexdigest()[:20]
+        return f"{self.base_dir}/{identity}"
+
+    def staged_dir(self, local_root: str | Path, *, namespace: str = "work") -> str:
         safe_namespace = "".join(
             ch if ch.isalnum() or ch in "-_" else "-" for ch in namespace
         ).strip("-") or "work"
-        return f"{self.base_dir}/{identity}/{safe_namespace}"
+        return f"{self.staged_root(local_root)}/{safe_namespace}"
 
     def sync_to(
         self,

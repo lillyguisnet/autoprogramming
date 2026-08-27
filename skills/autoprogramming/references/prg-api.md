@@ -432,21 +432,23 @@ candidate.
 Calling `finalize()` a second time raises `FinalizedError` — a second pass
 would let the report card steer the search and turn test into another val
 set. Do not skip finalize either: an un-finalized workspace ships nothing.
-Finalization also removes the orchestrated run's local and remote worker UV
-cache after all accepted candidates and declared artifacts are materialized.
+Finalization also removes the orchestrated run's owned local and remote UV
+caches and disposable `.venv*` package environments. It preserves all worker
+source, artifacts, outputs, and inactive-candidate diagnostics.
 
-## Remove worker scratch: `cleanup_search_cache`
+## Remove worker package caches: `cleanup_search_cache`
 
 ```py
 prg.cleanup_search_cache()            # finalized workspace
-prg.cleanup_search_cache(force=True)  # explicitly abandon unfinished resume state
+prg.cleanup_search_cache(force=True)  # cache-only cleanup for a paused workspace
 ```
 
-Paused and blocked runs keep worker files because repair/deepening resumes from
-them. Forced cleanup removes that resumable scratch, including task-local
-virtual environments, but never removes candidates or declared artifacts from
-the workspace. UV cache created by versions before this lifecycle was introduced
-can be pruned once with `uv cache prune`.
+Paused and blocked runs keep their package environments by default. Forced
+cleanup removes only owned UV caches and task-local `.venv*` directories; package
+setup can rebuild them later. It never removes worker files, candidates, declared
+artifacts, cached outputs, or inactive-candidate diagnostics. UV cache created by
+versions before this lifecycle was introduced can be pruned once with
+`uv cache prune`.
 
 ## Guards you will hit (by design)
 

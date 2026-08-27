@@ -561,11 +561,12 @@ class AgentHarness:
         portfolio.write(path)
 
     def cleanup_search_cache(self, *, force: bool = False) -> dict:
-        """Remove AutoProgramming-owned implementation-worker scratch.
+        """Remove AutoProgramming-owned package caches and environments.
 
         Finalized workspaces are safe to clean. For an unfinished workspace,
-        ``force=True`` explicitly abandons resumable worker state; candidates and
-        materialized runtime artifacts in the workspace are not removed.
+        ``force=True`` removes only package caches and disposable virtual
+        environments. Candidate source, artifacts, outputs, and inactive-candidate
+        diagnostics are never removed.
         """
         from .pi_worker import cleanup_worker_cache
 
